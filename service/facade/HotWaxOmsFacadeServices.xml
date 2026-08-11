@@ -15,11 +15,32 @@
             <parameter name="messages" type="List"/>
             <parameter name="errors" type="List"/>
             <parameter name="omsRestSourceConfigs" type="List">
-                <!-- omsRestSourceConfigId listed alongside isShared so the contract generator (a
-                     List out-parameter with exactly one child is read as "array of that child's
-                     scalar type", not "array of objects with that one property") emits an object
-                     items schema instead of silently collapsing to items: {type: boolean}. -->
+                <!-- House convention (matches ShopifyFacadeServices.xml and
+                     SettingsFacadeServices.xml's list#NsAuthConfigs): declare every field the
+                     service actually returns, not a subset. A List/Map out-parameter with a
+                     partial child set publishes a contract that is actively false — this row is
+                     OmsRestSourceSupport.safeConfigMapFromPlain (:409-429) plus isShared, in the
+                     same order, so it stays truthful. Declaring the full set also happens to be
+                     the only way a List out-parameter with exactly one child avoids the contract
+                     generator reading it as "array of that child's scalar type" instead of "array
+                     of objects" — but completeness is the actual rule; that quirk is a corollary. -->
                 <parameter name="omsRestSourceConfigId"/>
+                <parameter name="description"/>
+                <parameter name="companyUserGroupId"/>
+                <parameter name="baseUrl"/>
+                <parameter name="ordersPath"/>
+                <parameter name="timeZone"/>
+                <parameter name="authType"/>
+                <parameter name="hasUsername" type="Boolean"/>
+                <parameter name="hasPassword" type="Boolean"/>
+                <parameter name="hasApiToken" type="Boolean"/>
+                <parameter name="customHeaderNames" type="List"/>
+                <parameter name="connectTimeoutSeconds" type="Integer"/>
+                <parameter name="readTimeoutSeconds" type="Integer"/>
+                <parameter name="isActive"/>
+                <parameter name="canReadOrders" type="Boolean"/>
+                <parameter name="createdDate"/>
+                <parameter name="lastUpdatedDate"/>
                 <parameter name="isShared" type="Boolean"/>
             </parameter>
             <parameter name="pagination" type="Map">
@@ -57,6 +78,25 @@
             <parameter name="messages" type="List"/>
             <parameter name="errors" type="List"/>
             <parameter name="savedOmsRestSourceConfig" type="Map">
+                <!-- Same shape as omsRestSourceConfigs' item schema above (list#HotWaxOmsRestSourceConfigs)
+                     — safeConfigMapFromPlain plus isShared, declared in full per house convention. -->
+                <parameter name="omsRestSourceConfigId"/>
+                <parameter name="description"/>
+                <parameter name="companyUserGroupId"/>
+                <parameter name="baseUrl"/>
+                <parameter name="ordersPath"/>
+                <parameter name="timeZone"/>
+                <parameter name="authType"/>
+                <parameter name="hasUsername" type="Boolean"/>
+                <parameter name="hasPassword" type="Boolean"/>
+                <parameter name="hasApiToken" type="Boolean"/>
+                <parameter name="customHeaderNames" type="List"/>
+                <parameter name="connectTimeoutSeconds" type="Integer"/>
+                <parameter name="readTimeoutSeconds" type="Integer"/>
+                <parameter name="isActive"/>
+                <parameter name="canReadOrders" type="Boolean"/>
+                <parameter name="createdDate"/>
+                <parameter name="lastUpdatedDate"/>
                 <parameter name="isShared" type="Boolean"/>
             </parameter>
         </out-parameters>
