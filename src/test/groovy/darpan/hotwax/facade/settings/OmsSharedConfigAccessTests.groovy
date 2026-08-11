@@ -45,6 +45,7 @@ class OmsSharedConfigAccessTests {
     private static final String TEST_USER_ID = "TEST_CUSTOMER_USER"
     private static final String OWNER = "OMS_SHARE_OWNER"
     private static final String MEMBER = "OMS_SHARE_MEMBER"
+    private static final String STRANGER = "OMS_SHARE_STRANGER"
     private static final Timestamp TEST_FROM_DATE = Timestamp.valueOf("2026-05-01 00:00:00")
 
     // Distinct config ids per test so tests remain order-independent under
@@ -62,6 +63,7 @@ class OmsSharedConfigAccessTests {
         ReconciliationSmokeTestSupport.seedCompanyScope(ec)
         seedTenant(OWNER, "Share Owner")
         seedTenant(MEMBER, "Share Member")
+        seedTenant(STRANGER, "Share Stranger")
         seedConfigTypeEnumeration()
 
         seedHotWaxFixture(LIST_CONFIG_ID, "List fixture")
@@ -149,6 +151,40 @@ class OmsSharedConfigAccessTests {
         assertTrue((Boolean) ownerResult.ok, ownerResult.errors?.toString())
         assertEquals(true, ownerResult.deleted)
         assertNull(findOne(DELETE_CONFIG_ID), "the owner must still be able to delete its own shared config")
+    }
+
+    /**
+     * DAR-BE-005 Task 7 review finding: the collapse was verified by construction (reading the
+     * source) but never proven by a test that a genuine STRANGER — owns nothing, holds no
+     * ConfigTenantAccess grant — gets identical text for a real foreign-owned config as for a
+     * nonexistent one. Uses the SAME literal configId for both calls (sequenced: first while the
+     * id does not exist anywhere, then again after a real row is seeded under that exact id) —
+     * the "was not found" message echoes the caller-supplied id, so two DIFFERENT ids would
+     * trivially produce different text regardless of whether the collapse holds. This is the exact
+     * leak class Task 6 accidentally reopened one task before this one.
+     */
+    @Test
+    void deleteGivesAStrangerTheIdenticalMessageForARealAndANonexistentConfigId() {
+        String targetConfigId = "OMS_STRANGER_ORACLE_TARGET"
+        ec.user.setPreference(TenantAccessSupport.ACTIVE_TENANT_PREFERENCE_KEY, STRANGER)
+
+        // Pass 1: the id does not exist anywhere yet.
+        Map<String, Object> missingResult = deleteFacade(targetConfigId)
+        assertFalse((Boolean) missingResult.ok)
+
+        // Pass 2: a real config now exists under that SAME id, owned by another tenant, with no
+        // grant to this stranger.
+        ec.message.clearErrors()
+        seedHotWaxFixture(targetConfigId, "Stranger oracle target")
+        Map<String, Object> foreignResult = deleteFacade(targetConfigId)
+        assertFalse((Boolean) foreignResult.ok)
+        assertNotNull(findOne(targetConfigId),
+                "a stranger's delete attempt on a real foreign config must not delete it")
+
+        assertEquals(missingResult.errors, foreignResult.errors,
+                "a stranger (no ownership, no grant) must get byte-identical text whether the " +
+                "config id is real-but-foreign or does not exist at all — divergence here is a " +
+                "cross-tenant existence oracle")
     }
 
     private Map<String, Object> listFacade(Map<String, Object> parameters) {
