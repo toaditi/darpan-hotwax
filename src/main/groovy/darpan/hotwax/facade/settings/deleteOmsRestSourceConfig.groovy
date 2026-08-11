@@ -1,4 +1,5 @@
 import darpan.facade.common.FacadeSupport
+import darpan.facade.common.SharedConfigAccessSupport
 import darpan.facade.common.TenantAccessSupport
 import darpan.hotwax.oms.OmsRestSourceSupport
 
@@ -19,17 +20,37 @@ if (!ec.message.hasError()) {
         .disableAuthz()
         .useCache(false)
         .one()
+
+    boolean isOwner = config != null && TenantAccessSupport.canAccessTenantRecord(ec, config)
+
     try {
+        // Only an owned row is ever forwarded here (or none) — the peer-vs-stranger split below
+        // owns the ownership-mismatch decision for delete, so this call is left doing exactly what
+        // it always did (tenant-required, read-only) and never leaks via its own mismatch message.
         OmsRestSourceSupport.requireWritableTenantConfig(
-            config ? [companyUserGroupId: config.companyUserGroupId] : null,
+            isOwner ? [companyUserGroupId: config.companyUserGroupId] : null,
             activeTenantUserGroupId,
             TenantAccessSupport.hasActiveTenantWriteAccess(ec)
         )
-        if (config == null) {
-            ec.message.addError("HotWax OMS REST source config '${configId}' was not found.")
-        }
     } catch (IllegalArgumentException e) {
         ec.message.addError(e.message)
+    }
+
+    if (!ec.message.hasError() && !isOwner) {
+        if (config != null && SharedConfigAccessSupport.canActiveTenantUseConfig(ec,
+                SharedConfigAccessSupport.CONFIG_TYPE_HOTWAX_OMS, config)) {
+            // A peer may edit a shared config but must not delete the row its peers depend on.
+            // configId is polymorphic with no DB FK, so nothing would cascade the grants either.
+            ec.message.addError("OMS source config '${configId}' is shared from another " +
+                    "tenant. Stop sharing it instead of deleting it.")
+        } else {
+            // DAR-BE-005 oracle collapse: a nonexistent config and one this tenant has no
+            // standing on (not owner, not a peer) must be indistinguishable to the caller — the
+            // pre-Task-7 behavior threw a distinguishing "not available in your active tenant"
+            // message for the foreign-owned case here, which let any authenticated caller probe
+            // arbitrary ids for existence.
+            ec.message.addError("HotWax OMS REST source config '${configId}' was not found.")
+        }
     }
 }
 

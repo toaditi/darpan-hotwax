@@ -1,4 +1,5 @@
 import darpan.facade.common.FacadeSupport
+import darpan.facade.common.SharedConfigAccessSupport
 import darpan.facade.common.TenantAccessSupport
 import darpan.hotwax.oms.OmsRestSourceSupport
 
@@ -76,12 +77,19 @@ if (!ec.message.hasError()) {
         ec.message.addError("API key is required for API_KEY auth.")
     }
 
+    // DAR-BE-005: a member tenant may edit every field of a config shared with it (decision 3).
+    // Computed from the ConfigTenantAccess grant table for the row actually on disk, before the
+    // gate below, so this can never be forged by a caller-supplied parameter.
+    boolean isSharedPeer = existingConfig != null && SharedConfigAccessSupport.isSharedWithTenant(
+            ec, SharedConfigAccessSupport.CONFIG_TYPE_HOTWAX_OMS, configIdValue, activeTenantUserGroupId)
+
     if (!ec.message.hasError()) {
         try {
             OmsRestSourceSupport.requireWritableTenantConfig(
                     existingConfig ? [companyUserGroupId: existingConfig.companyUserGroupId] : null,
                     activeTenantUserGroupId,
-                    TenantAccessSupport.hasActiveTenantWriteAccess(ec)
+                    TenantAccessSupport.hasActiveTenantWriteAccess(ec),
+                    isSharedPeer
             )
         } catch (IllegalArgumentException e) {
             ec.message.addError(e.message)
@@ -89,10 +97,14 @@ if (!ec.message.hasError()) {
     }
 
     if (!ec.message.hasError()) {
+        // Ownership never transfers: an existing row keeps its original owner even when a peer
+        // saves it — only a brand-new row is assigned to the active tenant. Reassigning here would
+        // hand ownership to whichever peer saved last and anchor the peer group on the wrong tenant.
+        String ownerTenantUserGroupId = existingConfig?.companyUserGroupId ?: activeTenantUserGroupId
         Map configMap = [
                 omsRestSourceConfigId : configIdValue,
                 description           : descriptionValue,
-                companyUserGroupId    : activeTenantUserGroupId,
+                companyUserGroupId    : ownerTenantUserGroupId,
                 createdByUserId       : existingConfig?.createdByUserId ?: TenantAccessSupport.currentUserId(ec),
                 baseUrl               : baseUrlValue,
                 ordersPath            : ordersPathValue,
@@ -120,7 +132,8 @@ if (!ec.message.hasError()) {
                 .disableAuthz()
                 .call()
 
-        savedOmsRestSourceConfig = OmsRestSourceSupport.safeConfigMap(configMap)
+        savedOmsRestSourceConfig = OmsRestSourceSupport.safeConfigMap(configMap) +
+                [isShared: ownerTenantUserGroupId != activeTenantUserGroupId]
         ec.message.addMessage("Saved OMS REST source config ${configIdValue}.")
     }
 }

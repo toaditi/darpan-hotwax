@@ -14,7 +14,14 @@
             <parameter name="ok" type="Boolean"/>
             <parameter name="messages" type="List"/>
             <parameter name="errors" type="List"/>
-            <parameter name="omsRestSourceConfigs" type="List"/>
+            <parameter name="omsRestSourceConfigs" type="List">
+                <!-- omsRestSourceConfigId listed alongside isShared so the contract generator (a
+                     List out-parameter with exactly one child is read as "array of that child's
+                     scalar type", not "array of objects with that one property") emits an object
+                     items schema instead of silently collapsing to items: {type: boolean}. -->
+                <parameter name="omsRestSourceConfigId"/>
+                <parameter name="isShared" type="Boolean"/>
+            </parameter>
             <parameter name="pagination" type="Map">
                 <parameter name="pageIndex" type="Integer"/>
                 <parameter name="pageSize" type="Integer"/>
@@ -49,7 +56,9 @@
             <parameter name="ok" type="Boolean"/>
             <parameter name="messages" type="List"/>
             <parameter name="errors" type="List"/>
-            <parameter name="savedOmsRestSourceConfig" type="Map"/>
+            <parameter name="savedOmsRestSourceConfig" type="Map">
+                <parameter name="isShared" type="Boolean"/>
+            </parameter>
         </out-parameters>
     </service>
 

@@ -428,11 +428,21 @@ class OmsRestSourceSupport {
         ]
     }
 
-    static void requireWritableTenantConfig(Map existingConfig, String activeTenantUserGroupId, boolean canWrite) {
+    /**
+     * DAR-BE-005: {@code allowSharedPeer} defaults to today's strict owner-only behavior. The save
+     * path passes the caller's actual peer standing (computed from the ConfigTenantAccess grant
+     * table before this call) so a member tenant may edit every field of a shared config; the
+     * delete path never passes it, and additionally never forwards a foreign existingConfig here at
+     * all (see deleteOmsRestSourceConfig.groovy) — the peer-vs-stranger distinction for delete's
+     * denial text is decided by the caller, not this method, so this method's own mismatch message
+     * is never reached from delete and cannot leak a cross-tenant existence oracle there.
+     */
+    static void requireWritableTenantConfig(Map existingConfig, String activeTenantUserGroupId, boolean canWrite,
+                                            boolean allowSharedPeer = false) {
         String tenantId = normalize(activeTenantUserGroupId)
         if (!tenantId) throw new IllegalArgumentException("An active tenant is required for tenant-scoped writes.")
         if (!canWrite) throw new IllegalArgumentException("Your active tenant is read-only for this action.")
-        if (existingConfig && normalize(existingConfig.companyUserGroupId) != tenantId) {
+        if (existingConfig && normalize(existingConfig.companyUserGroupId) != tenantId && !allowSharedPeer) {
             throw new IllegalArgumentException("Requested OMS source config is not available in your active tenant.")
         }
     }

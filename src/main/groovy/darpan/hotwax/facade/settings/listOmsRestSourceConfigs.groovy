@@ -1,5 +1,6 @@
 import darpan.facade.common.FacadeSupport
 import darpan.facade.common.PaginationSupport
+import darpan.facade.common.SharedConfigAccessSupport
 import darpan.facade.common.TenantAccessSupport
 import darpan.hotwax.oms.OmsRestSourceSupport
 
@@ -15,13 +16,14 @@ List<Map<String, Object>> rows = []
 if (!activeTenantUserGroupId) {
     ec.message.addError("An active tenant is required to list OMS REST source configs.")
 } else {
-    List configs = ec.entity.find("darpan.hotwax.HotWaxOmsRestSourceConfig")
-            .condition("companyUserGroupId", activeTenantUserGroupId)
-            .disableAuthz()
-            .useCache(false)
-            .orderBy("description,omsRestSourceConfigId")
-            .list() ?: []
-    rows = configs.collect { cfg -> OmsRestSourceSupport.safeConfigMap(cfg) }
+    // DAR-BE-005: owned rows plus rows shared to this tenant. The bare disableAuthz() this replaces
+    // is gone; listAccessibleConfigRows routes through TenantScopedFinder on both halves.
+    List configs = SharedConfigAccessSupport.listAccessibleConfigRows(ec,
+            SharedConfigAccessSupport.CONFIG_TYPE_HOTWAX_OMS)
+    rows = configs.collect { cfg ->
+        OmsRestSourceSupport.safeConfigMap(cfg) +
+                [isShared: cfg.companyUserGroupId != activeTenantUserGroupId]
+    }
 }
 
 String search = normalize(query)?.toLowerCase()
