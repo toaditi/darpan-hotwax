@@ -355,7 +355,10 @@ class HotWaxOmsRestSourceConfigFacadeSmokeTests {
             ])
             .disableAuthz()
             .call()
-        assertTrue((mismatch.errors ?: []).join(" ").contains("not available in this automation tenant"))
+        // DAR-BE-005 B1: a foreign automation tenant with no standing (not owner, not a peer) now
+        // gets the same collapsed "not found" text as a nonexistent config id — see
+        // OmsRestSourceSupport.requireUsableOmsConfig's Javadoc for why the two messages merged.
+        assertTrue((mismatch.errors ?: []).join(" ").contains("not found"))
         assertFalse(mismatch.dataAvailable as boolean)
         assertEquals(0, mismatch.recordCount)
         assertNull(mismatch.fileLocation)

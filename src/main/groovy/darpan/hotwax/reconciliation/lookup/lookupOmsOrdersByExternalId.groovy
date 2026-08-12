@@ -1,4 +1,3 @@
-import darpan.facade.common.TenantAccessSupport
 import darpan.hotwax.oms.OmsRestSourceSupport
 
 ok = false
@@ -15,18 +14,7 @@ def sourceConfig = ec.entity.find("darpan.hotwax.HotWaxOmsRestSourceConfig")
         .useCache(false)
         .one()
 
-if (companyUserGroupIdValue) {
-    if (!sourceConfig) {
-        ec.message.addError("OMS REST source config ${configIdValue} not found.")
-    } else if (sourceConfig.companyUserGroupId?.toString()?.trim() != companyUserGroupIdValue) {
-        ec.message.addError("OMS REST source config ${configIdValue} is not available in this automation tenant.")
-    }
-} else {
-    TenantAccessSupport.requireTenantRecordAccess(
-            ec, sourceConfig,
-            "OMS REST source config ${configIdValue} not found.",
-            "OMS REST source config ${configIdValue} is not available in your active tenant.")
-}
+OmsRestSourceSupport.requireUsableOmsConfig(ec, sourceConfig, configIdValue, companyUserGroupIdValue)
 if (sourceConfig && (sourceConfig.isActive ?: "Y").toString().equalsIgnoreCase("N")) {
     ec.message.addError("OMS REST source config ${configIdValue} is inactive.")
 }

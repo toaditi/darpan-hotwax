@@ -3,6 +3,7 @@ package darpan.hotwax.oms
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 
+import darpan.facade.common.SharedConfigAccessSupport
 import darpan.reconciliation.source.SourceFilterSupport
 
 import static darpan.common.ValueSupport.boundedInt
@@ -465,6 +466,46 @@ class OmsRestSourceSupport {
         if (!canWrite) throw new IllegalArgumentException("Your active tenant is read-only for this action.")
         if (existingConfig && normalize(existingConfig.companyUserGroupId) != tenantId && !allowSharedPeer) {
             throw new IllegalArgumentException("Requested OMS source config is not available in your active tenant.")
+        }
+    }
+
+    /**
+     * DAR-BE-005 B1 — runtime credential *use* gate for the extract/lookup scripts that actually
+     * consume an OMS config's credentials (extractOmsOrders, extractOmsTransferOrders,
+     * extractOmsReconciliationOrders, extractOmsReturns, lookupOmsOrdersByExternalId). Tasks 1-13
+     * widened the settings-list/save/delete surfaces ({@link #requireWritableTenantConfig} above is
+     * the write-side analogue) but left these five sites strict owner-only, so a peer tenant could
+     * see and select a shared config and then have every run against it fail. Collapses all five
+     * sites onto one decision so they cannot drift the way five hand-rolled copies eventually would:
+     *
+     * <ul>
+     *   <li>{@code automationTenantUserGroupId} present — an automation execution, whose tenant is
+     *       server-derived from the already-gated automation record (not caller-supplied) — checked
+     *       against that EXPLICIT tenant via {@link SharedConfigAccessSupport#canTenantUseConfig}.</li>
+     *   <li>otherwise — an interactive/session caller — checked against the session's active tenant
+     *       via {@link SharedConfigAccessSupport#canActiveTenantUseConfig}.</li>
+     * </ul>
+     *
+     * <p>Both branches collapse to the SAME "not found" text on denial (also covers a null
+     * {@code sourceConfig}), matching the oracle-closing pattern Task 4 established and Tasks 6-8
+     * applied to every other read seam: a caller with no standing — missing config or foreign and
+     * not shared — must not be able to distinguish the two. The automation branch's tenant is
+     * server-derived rather than caller-supplied, so its oracle exposure was lower than the
+     * interactive branch's even before this fix, but both collapse the same way for consistency.</p>
+     *
+     * <p>With zero {@code ConfigTenantAccess} rows this is byte-identical to the pre-DAR-BE-005
+     * owner-only check: {@code canTenantUseConfig}/{@code canActiveTenantUseConfig} both reduce to
+     * {@code companyUserGroupId == tenant} when nothing is shared.</p>
+     */
+    static void requireUsableOmsConfig(def ec, def sourceConfig, String configId, String automationTenantUserGroupId) {
+        String trustedTenant = normalize(automationTenantUserGroupId)
+        boolean usable = trustedTenant
+                ? SharedConfigAccessSupport.canTenantUseConfig(ec,
+                        SharedConfigAccessSupport.CONFIG_TYPE_HOTWAX_OMS, sourceConfig, trustedTenant)
+                : SharedConfigAccessSupport.canActiveTenantUseConfig(ec,
+                        SharedConfigAccessSupport.CONFIG_TYPE_HOTWAX_OMS, sourceConfig)
+        if (!usable) {
+            ec.message.addError("OMS REST source config ${configId} not found.".toString())
         }
     }
 
