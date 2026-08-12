@@ -48,6 +48,16 @@ class OmsReturnsSourceSupport {
         OmsRestSourceSupport.resetHttpClient()
     }
 
+    /**
+     * Delegates to OmsRestSourceSupport.safeFileName for the same reason setHttpClient does above:
+     * one sanitization seam, not a reimplementation. The fallback is returns-specific
+     * ("oms-returns.json") so a caller-supplied blank fileName still lands on a returns-shaped
+     * default rather than the orders extractor's "oms-orders.json".
+     */
+    static String safeReturnsFileName(Object rawName) {
+        return OmsRestSourceSupport.safeFileName(rawName, "${DEFAULT_FILE_NAME_PREFIX}.json")
+    }
+
     static Map<String, Object> extractReturns(Object rawConfig, Object windowStart, Object windowEnd,
                                               List keepRecordFields, Closure pageProgressListener,
                                               List sourceFilters, Map options = [:]) {

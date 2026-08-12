@@ -169,6 +169,81 @@
         </out-parameters>
     </service>
 
+    <service verb="extract" noun="HotWaxOmsReturns" type="script" transaction="ignore" allow-remote="false" authenticate="true"
+            location="component://darpan-hotwax/src/main/groovy/darpan/hotwax/reconciliation/automation/extractOmsReturns.groovy">
+        <description>Extract HotWax OMS returns for an automation window from /rest/s1/oms/reconciliationReturns,
+            writing normalized JSON output to the automation data-manager folder (DAR-BE-018).
+
+            New capability — Darpan did not reconcile returns before this service, so there is no legacy
+            path to preserve. Same {records, metadata} on-disk contract and the same automation-edge
+            in/out parameters as the orders extractors, so the automation executor, progress heartbeat
+            and Spark compare stage are unchanged.
+
+            Lines arrive nested inside their header as items[] and are written through nested (RQ-21);
+            do not flatten. The endpoint pre-excludes returns with no Shopify reference server-side and
+            reports that as excludedNoShopifyRefCount; tenant-configured exclusions (typically on
+            returnChannelEnumId) still run client-side here, on the population that survives.</description>
+        <in-parameters>
+            <parameter name="omsRestSourceConfigId" required="true">
+                <description>Tenant-owned HotWaxOmsRestSourceConfig identifier. Reuses the same OMS credentials
+                    and baseUrl as order extraction; the returns path is pinned by the extractor.</description>
+            </parameter>
+            <parameter name="automationExecutionId">
+                <description>Automation execution id used to choose the default data-manager output folder.</description>
+            </parameter>
+            <parameter name="companyUserGroupId">
+                <description>Trusted automation owner tenant. When present, config access is checked against this tenant instead of a user-session active tenant.</description>
+            </parameter>
+            <parameter name="windowStart" required="true">
+                <description>Start of the automation window; accepts Timestamp, Date, ISO-8601 text, SQL timestamp text, or epoch milliseconds. Sent as the half-open lower bound returnDateFrom, which filters on ReturnHeader.entryDate (RQ-22).</description>
+            </parameter>
+            <parameter name="windowEnd" required="true">
+                <description>End of the automation window, same accepted formats. Sent as returnDateThru, which the endpoint treats as EXCLUSIVE, so consecutive chunks do not double-count their boundary.</description>
+            </parameter>
+            <parameter name="outputLocation">
+                <description>Optional output directory. Defaults to runtime://datamanager/reconciliation-runs/{automationExecutionId}/{timestamp}/.</description>
+            </parameter>
+            <parameter name="fileName">
+                <description>Optional output file name. Defaults to oms-returns-{fromMillis}-{thruMillis}.json.</description>
+            </parameter>
+            <parameter name="keepRecordFields" type="List">
+                <parameter name="fieldName"/>
+                <description>Optional projection of top-level record fields. items[] is always retained
+                    regardless of this list, because the nested-line contract (RQ-21) does not survive a
+                    projection that names only header fields.</description>
+            </parameter>
+            <parameter name="sourceFilters" type="List">
+                <parameter name="filterRule" type="Map">
+                    <parameter name="sequenceNum" type="Integer"/>
+                    <parameter name="fieldExpression"/>
+                    <parameter name="operator"/>
+                    <parameter name="filterValues"/>
+                </parameter>
+                <description>Optional record-exclusion rules, same semantics as the order extractors. These
+                    run client-side: the endpoint has no knowledge of tenant exclusion rules. The expected
+                    rule here excludes returns whose returnChannelEnumId never has a Shopify counterpart.</description>
+            </parameter>
+            <parameter name="reconciliationRunResultId">
+                <description>Optional observability run id for progress heartbeats. Advisory only.</description>
+            </parameter>
+            <parameter name="progressStageCode">
+                <description>Which extract stage this run is: EXTRACT_FILE1 or EXTRACT_FILE2. Defaults to EXTRACT_FILE2.</description>
+            </parameter>
+            <parameter name="expectedRecordCount" type="Integer">
+                <description>Optional expected total, which adds a progress percent alongside the count.</description>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="dataAvailable" type="Boolean"/>
+            <parameter name="fileLocation"/>
+            <parameter name="fileName"/>
+            <parameter name="recordCount" type="Integer"/>
+            <parameter name="requestMetadata" type="Map"/>
+            <parameter name="warnings" type="List"/>
+            <parameter name="errors" type="List"/>
+        </out-parameters>
+    </service>
+
     <service verb="extract" noun="HotWaxOmsTransferOrders" type="script" transaction="ignore" allow-remote="false" authenticate="true"
             location="component://darpan-hotwax/src/main/groovy/darpan/hotwax/reconciliation/automation/extractOmsTransferOrders.groovy">
         <description>Extract HotWax OMS transfer orders (orderTypeId=TRANSFER_ORDER) by date window and/or
