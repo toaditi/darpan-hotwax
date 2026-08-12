@@ -252,4 +252,101 @@ class OmsReturnsExtractTests {
         body.putAll(extras)
         return JsonOutput.toJson(body)
     }
+
+    // --- configured channel exclusion + count hygiene (DAR-BE-018 Task 3, design §5, §9.5) -------
+
+    @Test
+    void excludesReturnsMatchingTheConfiguredChannelRule() {
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            return [statusCode: 200, body: returnsBody([
+                    returnRecord("1001", "5001"),
+                    posReturnRecord("1002", "5002"),
+            ], false)]
+        }
+
+        Map result = OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, channelExclusion(), [:])
+
+        assertEquals(1, result.recordCount, "the POS-channel return must be dropped")
+        Map filters = (Map) ((Map) result.requestMetadata).get("filters")
+        List configured = (List) filters.get("configuredExclusions")
+        assertEquals(1, ((Map) configured[0]).get("excludedCount"))
+    }
+
+    @Test
+    void keepsReturnsThatLackTheConfiguredFieldEntirely() {
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            Map noChannel = returnRecord("1001", "5001")
+            noChannel.remove("returnChannelEnumId")
+            return [statusCode: 200, body: returnsBody([noChannel], false)]
+        }
+
+        Map result = OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, channelExclusion(), [:])
+
+        assertEquals(1, result.recordCount,
+                "a record lacking the configured field is KEPT — a rule removes only on a matching value")
+    }
+
+    @Test
+    void reportsAConfiguredRuleThatMatchedNothingWithZeroRatherThanOmittingIt() {
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            return [statusCode: 200, body: returnsBody([returnRecord("1001", "5001")], false)]
+        }
+
+        Map result = OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, channelExclusion(), [:])
+
+        List configured = (List) ((Map) ((Map) result.requestMetadata).get("filters")).get("configuredExclusions")
+        assertEquals(1, configured.size(), "a rule that matched nothing must still be reported")
+        assertEquals(0, ((Map) configured[0]).get("excludedCount"))
+    }
+
+    @Test
+    void omitsConfiguredExclusionsEntirelyWhenNoRulesAreConfigured() {
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            return [statusCode: 200, body: returnsBody([returnRecord("1001", "5001")], false)]
+        }
+
+        Map result = OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, null, [:])
+
+        Map filters = (Map) ((Map) result.requestMetadata).get("filters")
+        assertFalse(filters.containsKey("configuredExclusions"),
+                "absent entirely, not an empty list — backward-compatible metadata")
+    }
+
+    @Test
+    void serverExcludedReturnsAreNeverCountedByAConfiguredRule() {
+        // The server already dropped 4 no-Shopify-ref returns; they never reach the client filter,
+        // so the two counts describe disjoint populations and cannot double-count (design §9.5).
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            return [statusCode: 200, body: returnsBody([posReturnRecord("1002", "5002")], false,
+                    [excludedNoShopifyRefCount: 4])]
+        }
+
+        Map result = OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, channelExclusion(), [:])
+
+        Map filters = (Map) ((Map) result.requestMetadata).get("filters")
+        assertEquals(4, filters.get("excludedNoShopifyRefCount"))
+        List configured = (List) filters.get("configuredExclusions")
+        assertEquals(1, ((Map) configured[0]).get("excludedCount"),
+                "the configured rule counts only what actually reached the client")
+    }
+
+    private static Map posReturnRecord(String returnId, String externalId) {
+        Map record = returnRecord(returnId, externalId)
+        record.put("returnChannelEnumId", "POS_RETURN_CHANNEL")
+        return record
+    }
+
+    private static List channelExclusion() {
+        return [[
+                sequenceNum    : 1,
+                fieldExpression: "returnChannelEnumId",
+                operator       : "EXCLUDE_IN",
+                filterValues   : "POS_RETURN_CHANNEL",
+        ]]
+    }
 }
