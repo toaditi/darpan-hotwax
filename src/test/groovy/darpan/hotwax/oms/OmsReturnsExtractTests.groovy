@@ -1,6 +1,7 @@
 package darpan.hotwax.oms
 
 import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 
@@ -103,6 +104,104 @@ class OmsReturnsExtractTests {
         Map filters = (Map) ((Map) result.requestMetadata).get("filters")
         assertEquals(3, filters.get("excludedNoShopifyRefCount"))
         assertEquals(7, filters.get("serverReportedReturnsCount"))
+    }
+
+    // --- extractReturnsToFile cleanup contract ---------------------------
+    //
+    // Mirrors OmsRestSourceSupport.extractOrdersToFile / OrdersDocumentSink: a mid-window failure
+    // must never leave a well-formed-looking but silently partial JSON file on disk, and the file
+    // mode's result Map must never carry a `records` key, success or failure.
+
+    @Test
+    void extractReturnsToFileLeavesNoFileOnMidPaginationHttpFailure() {
+        File target = File.createTempFile("oms-returns-http-failure-", ".json")
+        target.delete() // createTempFile pre-creates an empty file; start from a clean, absent path
+        try {
+            int callCount = 0
+            OmsReturnsSourceSupport.setHttpClient { Map request ->
+                callCount++
+                // Page 1 succeeds and writes a real record to the file — this proves abort() is
+                // deleting an actually-partial file, not just skipping a file that was never opened.
+                if (callCount == 1) return [statusCode: 200, body: returnsBody([returnRecord("1001", "5001")], true)]
+                return [statusCode: 500, body: "internal error"]
+            }
+
+            Map result = OmsReturnsSourceSupport.extractReturnsToFile(baseConfig(), "2026-05-01T00:00:00Z",
+                    "2026-05-02T00:00:00Z", target, null, null, null, [:])
+
+            assertFalse((result.errors as List).isEmpty(), "a mid-pagination HTTP failure must be reported as an error")
+            assertFalse(target.exists(),
+                    "a mid-pagination HTTP failure must leave no file on disk, not a silently partial one: ${target}")
+        } finally {
+            target.delete()
+        }
+    }
+
+    @Test
+    void extractReturnsToFileLeavesNoFileOnMidPaginationJsonParseFailure() {
+        File target = File.createTempFile("oms-returns-json-failure-", ".json")
+        target.delete()
+        try {
+            int callCount = 0
+            OmsReturnsSourceSupport.setHttpClient { Map request ->
+                callCount++
+                if (callCount == 1) return [statusCode: 200, body: returnsBody([returnRecord("1001", "5001")], true)]
+                return [statusCode: 200, body: "not valid json"]
+            }
+
+            Map result = OmsReturnsSourceSupport.extractReturnsToFile(baseConfig(), "2026-05-01T00:00:00Z",
+                    "2026-05-02T00:00:00Z", target, null, null, null, [:])
+
+            assertFalse((result.errors as List).isEmpty(), "a mid-pagination JSON-parse failure must be reported as an error")
+            assertFalse(target.exists(),
+                    "a mid-pagination JSON-parse failure must leave no file on disk, not a silently partial one: ${target}")
+        } finally {
+            target.delete()
+        }
+    }
+
+    @Test
+    void extractReturnsToFileFailureResultCarriesNoRecordsKey() {
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            return [statusCode: 500, body: "internal error"]
+        }
+        File target = File.createTempFile("oms-returns-no-records-key-", ".json")
+        target.delete()
+        try {
+            Map result = OmsReturnsSourceSupport.extractReturnsToFile(baseConfig(), "2026-05-01T00:00:00Z",
+                    "2026-05-02T00:00:00Z", target, null, null, null, [:])
+
+            assertFalse((result.errors as List).isEmpty())
+            assertFalse(result.containsKey("records"),
+                    "extractReturnsToFile's contract is 'same Map minus records' on every path, including failure: ${result.keySet()}")
+        } finally {
+            target.delete()
+        }
+    }
+
+    @Test
+    void extractReturnsToFileWritesAValidDocumentOnSuccessAndOmitsRecordsFromTheResult() {
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            return [statusCode: 200, body: returnsBody([returnRecord("1001", "5001")], false)]
+        }
+        File target = File.createTempFile("oms-returns-success-", ".json")
+        target.delete()
+        try {
+            Map result = OmsReturnsSourceSupport.extractReturnsToFile(baseConfig(), "2026-05-01T00:00:00Z",
+                    "2026-05-02T00:00:00Z", target, null, null, null, [:])
+
+            assertTrue((result.errors as List).isEmpty(), result.errors.toString())
+            assertFalse(result.containsKey("records"),
+                    "extractReturnsToFile's contract is 'same Map minus records', even on success: ${result.keySet()}")
+            assertTrue(target.exists(), "a successful extraction must write the file")
+
+            Map written = (Map) new JsonSlurper().parse(target)
+            List writtenRecords = (List) written.get("records")
+            assertEquals(1, writtenRecords.size())
+            assertNotNull(((Map) writtenRecords[0]).get("items"), "items[] must survive the file-mode write too")
+        } finally {
+            target.delete()
+        }
     }
 
     // --- fixtures -------------------------------------------------------

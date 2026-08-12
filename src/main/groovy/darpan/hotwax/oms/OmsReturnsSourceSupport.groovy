@@ -81,12 +81,12 @@ class OmsReturnsSourceSupport {
         // below still works.
         Map<String, Object> config = OmsRestSourceSupport.toPlainMap(rawConfig)
         if (!config) {
-            return failure(["OMS REST source config could not be read."])
+            return failure(["OMS REST source config could not be read."], [], retainRecords)
         }
 
         Long fromMillis = OmsRestSourceSupport.parseWindowMillis(windowStart, "windowStart", errors)
         Long thruMillis = OmsRestSourceSupport.parseWindowMillis(windowEnd, "windowEnd", errors)
-        if (errors) return failure(errors)
+        if (errors) return failure(errors, [], retainRecords)
 
         String endpointUrl = OmsRestSourceSupport.buildOrdersEndpointUrl(
                 normalize(config.baseUrl), DEFAULT_RETURNS_PATH)
@@ -95,7 +95,7 @@ class OmsReturnsSourceSupport {
         try {
             headers = OmsRestSourceSupport.buildHeaders(config)
         } catch (IllegalArgumentException e) {
-            return failure([normalize(e.message) ?: "OMS auth configuration is invalid."])
+            return failure([normalize(e.message) ?: "OMS auth configuration is invalid."], [], retainRecords)
         }
 
         // Parsed once, before any HTTP call, so a malformed rule fails pre-flight rather than
@@ -105,7 +105,7 @@ class OmsReturnsSourceSupport {
         try {
             parsedFilters = SourceFilterSupport.parseRules(sourceFilters)
         } catch (Exception e) {
-            return failure([normalize(e.message) ?: "Configured exclusion rules are invalid."])
+            return failure([normalize(e.message) ?: "Configured exclusion rules are invalid."], [], retainRecords)
         }
 
         int pageSize = normalizeInt(options?.pageSize, DEFAULT_RETURNS_PAGE_SIZE)
@@ -116,7 +116,6 @@ class OmsReturnsSourceSupport {
         long cumulativeRaw = 0L
 
         try {
-            sink.begin()
             int pageIndex = 0
             boolean hasMore = true
             while (hasMore) {
@@ -170,14 +169,31 @@ class OmsReturnsSourceSupport {
                 hasMore = body.get("hasMore") == true
                 pageIndex++
             }
-            sink.finish(buildMetadata(serverCounts, exclusionCounts, parsedFilters))
+            // finish() must never run on an error-triggered break out of the loop above — it would
+            // write a well-formed closing `],"metadata":{...}}` onto a file that only holds the
+            // pages fetched before the failure, producing a valid-looking but silently partial
+            // document. Mirrors OmsRestSourceSupport.extractOrdersInternal, which calls
+            // sink.abort() (not finish()) on every one of its own error returns.
+            if (errors) {
+                sink.abort()
+            } else {
+                sink.finish(buildMetadata(serverCounts, exclusionCounts, parsedFilters))
+            }
         } catch (Exception e) {
+            sink.abort()
             errors.add("OMS returns extraction failed: ${e.message}".toString())
         } finally {
             sink.close()
         }
 
-        if (errors) return failure(errors, warnings)
+        if (errors) {
+            // Mirrors OmsRestSourceSupport.extractOrdersToFile's `sink.abort(); targetFile.delete()`
+            // on any error: abort() above already closed the writer without the closing bracket, so
+            // whatever partial bytes it wrote must not be left on disk looking like a real file.
+            // No-op for the in-memory extractReturns path (targetFile is null there).
+            if (targetFile != null) targetFile.delete()
+            return failure(errors, warnings, retainRecords)
+        }
 
         int recordCount = sink.writtenCount
         Map<String, Object> result = [
@@ -246,12 +262,28 @@ class OmsReturnsSourceSupport {
         return [filters: filters]
     }
 
-    private static Map<String, Object> failure(List<String> errors, List<String> warnings = []) {
-        return [records: [], recordCount: 0, dataAvailable: false, requestMetadata: [:],
+    // retainRecords, NOT unconditional: extractReturnsToFile's contract is "same Map minus records"
+    // on EVERY path, not just success. A failure() that always carried `records: []` would leave
+    // the key present (if empty) on every extractReturnsToFile error, contradicting that contract
+    // and the sibling's extractOrdersToFile, which strips `records` unconditionally.
+    private static Map<String, Object> failure(List<String> errors, List<String> warnings = [],
+                                                boolean retainRecords = true) {
+        Map<String, Object> result = [recordCount: 0, dataAvailable: false, requestMetadata: [:],
                 warnings: warnings ?: [], errors: errors ?: [], fileName: null]
+        if (retainRecords) result.put("records", [])
+        return result
     }
 
-    /** Streams {records:[...],metadata:{...}} so a month-scale window never holds more than a page. */
+    /**
+     * Streams {records:[...],metadata:{...}} so a month-scale window never holds more than a page.
+     *
+     * Mirrors OmsRestSourceSupport.OrdersDocumentSink's cleanup contract exactly: the writer opens
+     * LAZILY on the first actual write (never in advance), so a request that fails before a single
+     * record is known good never creates a file at all; and abort() closes without writing the
+     * closing bracket/metadata, so a mid-window failure leaves either no file (nothing was ever
+     * written) or a deliberately-unterminated fragment that the caller then deletes — never a
+     * well-formed-looking but silently partial document.
+     */
     protected static class OutputSink {
         private final File targetFile
         private Writer writer
@@ -260,8 +292,8 @@ class OmsReturnsSourceSupport {
 
         OutputSink(File targetFile) { this.targetFile = targetFile }
 
-        void begin() {
-            if (targetFile == null) return
+        private void ensureOpen() {
+            if (writer != null || targetFile == null) return
             targetFile.getParentFile()?.mkdirs()
             writer = new OutputStreamWriter(new FileOutputStream(targetFile), "UTF-8")
             writer.write('{"records":[')
@@ -269,18 +301,28 @@ class OmsReturnsSourceSupport {
 
         void write(Map<String, Object> record) {
             writtenCount++
-            if (writer == null) return
+            if (targetFile == null) return
+            ensureOpen()
             if (!first) writer.write(",")
             writer.write(JsonOutput.toJson(record))
             first = false
         }
 
         void finish(Map<String, Object> metadata) {
-            if (writer == null) return
+            if (targetFile == null) return
+            ensureOpen()
             writer.write('],"metadata":')
             writer.write(JsonOutput.toJson(metadata ?: [:]))
             writer.write('}')
             writer.flush()
+        }
+
+        /** Closes without writing the closing bracket/metadata — never call finish() after this. */
+        void abort() {
+            if (writer != null) {
+                try { writer.close() } catch (Exception ignored) { }
+                writer = null
+            }
         }
 
         void close() {
