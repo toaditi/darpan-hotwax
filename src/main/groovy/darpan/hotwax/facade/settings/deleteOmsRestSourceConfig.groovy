@@ -1,5 +1,6 @@
 import darpan.facade.common.FacadeSupport
 import darpan.facade.common.SharedConfigAccessSupport
+import darpan.facade.common.SharedConfigGrantSupport
 import darpan.facade.common.TenantAccessSupport
 import darpan.hotwax.oms.OmsRestSourceSupport
 
@@ -51,6 +52,18 @@ if (!ec.message.hasError()) {
             // arbitrary ids for existence.
             ec.message.addError("HotWax OMS REST source config '${configId}' was not found.")
         }
+    }
+
+    // Task 9: even the owner cannot delete a config that still has active grants. configId is
+    // polymorphic with no DB FK, so a delete cascades nothing and every peer tenant's automation
+    // would break at run time with a confusing "not found" instead of failing loudly here. Runs
+    // AFTER the standing check above (isOwner only) so a peer/stranger denial is never displaced
+    // by this message.
+    if (!ec.message.hasError() && isOwner &&
+            SharedConfigGrantSupport.hasActiveGrants(ec,
+                    SharedConfigAccessSupport.CONFIG_TYPE_HOTWAX_OMS, configId)) {
+        ec.message.addError("OMS source config '${configId}' is shared with other tenants. " +
+                "Stop sharing it with every tenant before deleting it.")
     }
 }
 

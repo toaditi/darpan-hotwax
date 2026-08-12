@@ -136,8 +136,15 @@ class OmsSharedConfigAccessTests {
         assertTrue(saved.isShared as boolean, "the save response must also flag the row isShared for the peer")
     }
 
+    /**
+     * DAR-BE-005 Task 9: a config with an active grant cannot be deleted by ANYONE, including its
+     * owner — configId is polymorphic with no DB FK, so a delete would cascade nothing and leave
+     * the peer's automation failing at run time with a confusing "not found" instead of failing
+     * loudly here. This complements (does not replace) the peer-cannot-delete rule Task 7 already
+     * proved: a peer never deletes; an owner deletes only once the group is empty.
+     */
     @Test
-    void deleteRejectsAMemberTenantNamingRevokeAndAcceptsTheOwner() {
+    void deleteRejectsAMemberTenantAndTheOwnerWhileAGrantRemainsActive() {
         ec.user.setPreference(TenantAccessSupport.ACTIVE_TENANT_PREFERENCE_KEY, MEMBER)
         Map<String, Object> blockedResult = deleteFacade(DELETE_CONFIG_ID)
         assertFalse((Boolean) blockedResult.ok)
@@ -148,9 +155,38 @@ class OmsSharedConfigAccessTests {
         ec.message.clearErrors()
         ec.user.setPreference(TenantAccessSupport.ACTIVE_TENANT_PREFERENCE_KEY, OWNER)
         Map<String, Object> ownerResult = deleteFacade(DELETE_CONFIG_ID)
+        assertFalse((Boolean) ownerResult.ok,
+                "the owner must not be able to delete a config that still has an active grant")
+        assertTrue((ownerResult.errors ?: []).join(" ").contains(
+                "Stop sharing it with every tenant before deleting it"),
+                "the owner-cannot-delete-while-shared guard must fire: ${ownerResult.errors}")
+        assertNotNull(findOne(DELETE_CONFIG_ID),
+                "the config must survive even the owner's delete attempt while a grant is active")
+    }
+
+    /**
+     * DAR-BE-005 Task 9, the other half: once every grant on a config is revoked, the owner may
+     * delete it normally — the guard is about live dependents, not a permanent lock.
+     */
+    @Test
+    void deleteAcceptsTheOwnerOnceEveryGrantIsRevoked() {
+        String configId = "OWNER_DELETE_AFTER_REVOKE_HOTWAX"
+        seedHotWaxFixture(configId, "Delete-after-revoke fixture")
+        seedGrant(configId)
+
+        ec.user.setPreference(TenantAccessSupport.ACTIVE_TENANT_PREFERENCE_KEY, OWNER)
+        Map<String, Object> blockedResult = deleteFacade(configId)
+        assertFalse((Boolean) blockedResult.ok,
+                "the owner must not be able to delete a config that still has an active grant")
+        assertNotNull(findOne(configId), "a blocked delete must not remove the row")
+
+        ec.message.clearErrors()
+        revokeGrant(configId, Timestamp.valueOf("2026-05-02 00:00:00"))
+
+        Map<String, Object> ownerResult = deleteFacade(configId)
         assertTrue((Boolean) ownerResult.ok, ownerResult.errors?.toString())
         assertEquals(true, ownerResult.deleted)
-        assertNull(findOne(DELETE_CONFIG_ID), "the owner must still be able to delete its own shared config")
+        assertNull(findOne(configId), "once every grant is revoked the owner may delete normally")
     }
 
     /**
@@ -319,6 +355,35 @@ class OmsSharedConfigAccessTests {
             thruDate         : null,
             grantedByUserId  : TEST_USER_ID,
         ])
+    }
+
+    /** Soft-revokes the MEMBER grant seeded by {@link #seedGrant} — sets thruDate rather than
+     *  deleting the row, matching production revoke semantics (SharedConfigGrantSupport.revokeAccess). */
+    private void revokeGrant(String configId, Timestamp thruDate) {
+        boolean alreadyDisabled = ec.artifactExecution.disableAuthz()
+        ArtifactExecutionInfo aei = ec.artifactExecution.push(
+            "revokeOmsSharedConfigAccess",
+            ArtifactExecutionInfo.AT_OTHER,
+            ArtifactExecutionInfo.AUTHZA_ALL,
+            false
+        )
+        ec.artifactExecution.setAnonymousAuthorizedAll()
+        try {
+            ec.service.sync()
+                .name("update#${GRANT_ENTITY_NAME}")
+                .parameters([
+                    configTypeEnumId : CONFIG_TYPE,
+                    configId         : configId,
+                    tenantUserGroupId: MEMBER,
+                    fromDate         : TEST_FROM_DATE,
+                    thruDate         : thruDate,
+                ])
+                .disableAuthz()
+                .call()
+        } finally {
+            ec.artifactExecution.pop(aei)
+            if (!alreadyDisabled) ec.artifactExecution.enableAuthz()
+        }
     }
 
     private void upsertEntityValue(String entityName, Map<String, Object> pkFields, Map<String, Object> fields) {
