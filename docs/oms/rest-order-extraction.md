@@ -50,6 +50,59 @@ When the caller passes `keepRecordFields` (the SourceSystemConnector registry de
 
 Each fetched page is filtered and appended to the output file on disk before the next page is requested; the extractor never holds more than roughly one page of orders in memory, so month-scale windows do not scale heap usage. The extractor keeps only HotWax orders with `orderTypeId` equal to `SALES_ORDER` and excludes orders that contain an order item association with `orderItemAssocTypeId` equal to `EXCHANGE`. Non-sales orders and exchange orders are not written to the normalized source file and are therefore not compared against Shopify orders. Output metadata includes `filters.excludedNonSalesOrderCount` and `filters.excludedExchangeOrderCount` so the run can distinguish fetched HotWax records from comparison-eligible records. Excluded exchange orders are additionally captured into a sidecar `<extract-name>.exchange-manifest.json` file (`{manifest, truncated, sourceFileName}`, entries are ids/amounts only — `omsOrderId`, `externalId`, `orderName`, `toOrderId`, `grandTotal`, `orderDate`, `statusId` — capped at 500 entries), which the exchange pair verify stage consumes to check exchange orders against their linked original order rather than silently dropping them. `filters.exchangeManifestTruncated` marks windows where the cap was hit.
 
+### Reconciliation Orders endpoint (opt-in)
+
+Service: `reconciliation.HotWaxOmsExtractionServices.extract#HotWaxOmsReconciliationOrders`
+Connector row: `OMS_RECON_ORDERS` / `expectedSourceConfigType=HOTWAX_OMS_REST_RECON`
+
+A second, **additive** OMS orders connector served by a purpose-built endpoint that does server-side
+what the extractor above does client-side. The legacy connector is unchanged and remains the default;
+a rule set adopts this one by pointing its source at `HOTWAX_OMS_REST_RECON`, against the **same**
+`HotWaxOmsRestSourceConfig` row (same credentials, same `baseUrl`).
+
+```text
+GET {baseUrl}/rest/s1/oms/reconciliationOrders?orderDateFrom=<startEpochMillis>&orderDateThru=<endEpochMillis>&pageSize=<n>&pageIndex=<n>
+```
+
+The path is **fixed by the extractor**, not read from the config's `ordersPath` column — that column
+holds the legacy `/rest/s1/oms/orders` on every existing tenant config, so honouring it here would
+send recon-shaped requests to the legacy endpoint.
+
+Five differences from the legacy path, all of them inside `OmsRestSourceSupport`; the service
+contract, the on-disk `{records, metadata}` file and the sidecar shape are identical, so the
+automation edge and the Spark compare stage are unchanged.
+
+| | Legacy `/orders` | `/reconciliationOrders` |
+|---|---|---|
+| Window params | `orderDate_from` / `orderDate_thru` | `orderDateFrom` / `orderDateThru`, half-open `[from, thru)` |
+| Sales-order filter | client-side, on `orderTypeId` | server-side; the client filter is skipped (`orderTypeId` is not in the projection, so re-running it would discard every record) |
+| Exchange orders | excluded client-side by scanning order-item associations | delivered inline flagged `isExchange`; the client drops them and builds the manifest from inline `originalOrderId` / `originalExternalId` — **no pair-lookup round-trips** |
+| Termination | inferred from empty / repeated / shorter pages, plus a 50-record truncation probe | `hasMore`; the probe and the strategy fallback are both skipped |
+| Projection | client-side via `keepRecordFields` | server-side, fixed set |
+
+Response counts are surfaced in `requestMetadata.filters`: the server's
+`excludedNonSalesOrderCount` replaces the (structurally zero) client count under the same key,
+`ordersCount` appears as `serverReportedOrdersCount`, and `missingExternalIdCount` — orders the
+server dropped for an empty join key, which has no legacy equivalent — is reported alongside them.
+`excludedExchangeOrderCount` stays the client's own count, because this client still does that drop.
+
+An over-maximum `pageSize` is **rejected**, never silently capped: the extract fails with the
+server's error code and stated limit rather than working around it.
+
+**Gating — verify before enabling for a rule set.** The endpoint returns a fixed field set
+(`orderId`, `externalId`, `orderName`, `grandTotal`, `orderDate`, `statusId`). Confirm the rule set's
+join key and every field-comparison field fall inside it; anything wider must stay on
+`extract#HotWaxOmsOrders`. The same limit narrows the rules-board pills: `salesChannelEnumId` and
+`productStoreId` are offered on the legacy connector only, because an exclusion rule naming a field
+the endpoint never returns would validate, persist, and then exclude nothing.
+
+Configured exclusions (below) still run **client-side** on this connector — the endpoint has no
+knowledge of tenant exclusion rules.
+
+> **Status.** Shape verified against fixtures only. As of 2026-08-11 no live response from this
+> endpoint has been captured, and count/diff parity against the legacy connector over a frozen
+> window has not been run.
+
 ### Configurable record exclusion
 
 Beyond the two built-in filters above, a rule set can configure its own per-field exclusion rules on either source's extraction. These are ordinary tenant-configured rules — a field to test and a set of values that disqualify a record — layered on top of the built-in `SALES_ORDER`/`EXCHANGE` filtering rather than replacing it.

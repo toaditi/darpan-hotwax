@@ -52,6 +52,21 @@ class OmsRestSourceSupport {
     static final int OMS_DEFAULT_SERVER_PAGE_SIZE = 50
     static final String DEFAULT_WINDOW_FIELD_NAME = "orderDate"
 
+    // ---- /rest/s1/oms/reconciliationOrders (DAR-BE-018) ------------------------------------------
+    // A purpose-built endpoint that filters, projects and counts server-side. It is a DIFFERENT
+    // contract from DEFAULT_ORDERS_PATH, not a tunable of it: different window parameter names,
+    // an authoritative hasMore/ordersCount instead of the shrinking-page heuristic, and exchange
+    // orders delivered inline behind a flag rather than excluded. The path is fixed rather than
+    // read from HotWaxOmsRestSourceConfig.ordersPath because that column holds the LEGACY path on
+    // every existing tenant config — honouring it here would silently call /orders in recon mode.
+    static final String DEFAULT_RECON_ORDERS_PATH = "/rest/s1/oms/reconciliationOrders"
+    static final String RECON_WINDOW_FROM_PARAM = "orderDateFrom"
+    static final String RECON_WINDOW_THRU_PARAM = "orderDateThru"
+    // Over-max pageSize is rejected, never silently capped (RQ-25), so this is terminal and
+    // actionable rather than one more recoverable-pagination status to fall through.
+    static final String PAGE_SIZE_TOO_LARGE_CODE = "PAGE_SIZE_TOO_LARGE"
+    static final String RECON_EXCHANGE_FLAG_FIELD = "isExchange"
+
     private static final JsonSlurper JSON_SLURPER = new JsonSlurper()
     private static final List<String> CONFIG_FIELD_NAMES = [
             "omsRestSourceConfigId",
@@ -184,7 +199,12 @@ class OmsRestSourceSupport {
         }
 
         String baseUrl = normalize(config?.baseUrl)
-        String ordersPath = normalize(config?.ordersPath) ?: DEFAULT_ORDERS_PATH
+        // Recon mode pins its own path instead of honouring config.ordersPath: that column holds the
+        // legacy /rest/s1/oms/orders on every tenant config that exists today, so reading it here
+        // would send recon-shaped requests to the legacy endpoint and silently extract nothing.
+        String ordersPath = (options.reconEndpoint as boolean)
+                ? DEFAULT_RECON_ORDERS_PATH
+                : (normalize(config?.ordersPath) ?: DEFAULT_ORDERS_PATH)
         String timeZone = normalize(config?.timeZone) ?: DEFAULT_TIME_ZONE
         if (!baseUrl) errors.add("Base URL is required.")
 
@@ -324,7 +344,8 @@ class OmsRestSourceSupport {
                 maxRecords: options.maxRecords,
         ] : null
         requestMetadata.filters = buildFilterMetadata(excludedNonSalesOrderCount, excludedExchangeOrderCount,
-                exchangeManifestTruncated, excludeRules, excludedByRuleCounts, stateExtractMetadata)
+                exchangeManifestTruncated, excludeRules, excludedByRuleCounts, stateExtractMetadata,
+                (Map<String, Object>) extraction.serverCounts)
         Map documentMetadata = requestMetadata + [
                 sourceType            : "HOTWAX_OMS_REST_ORDERS",
                 omsRestSourceConfigId : normalize(config?.omsRestSourceConfigId),
@@ -601,6 +622,16 @@ class OmsRestSourceSupport {
     protected static Map<String, Object> buildOrdersQueryParams(Map<String, Object> options,
                                                                 Long fromMillis, Long thruMillis) {
         Map<String, Object> queryParams = new LinkedHashMap<>()
+
+        // The recon endpoint names its bounds orderDateFrom/orderDateThru and defines them as
+        // half-open [from, thru). It carries no order-type or status parameters at all: the
+        // comparison-eligibility filter is the server's job there, which is the point of the
+        // endpoint. Returning early keeps the legacy query shape byte-identical below.
+        if (options.reconEndpoint as boolean) {
+            if (fromMillis != null) queryParams.put(RECON_WINDOW_FROM_PARAM, fromMillis)
+            if (thruMillis != null) queryParams.put(RECON_WINDOW_THRU_PARAM, thruMillis)
+            return queryParams
+        }
 
         // The window is optional: a state-based extract defines its population by status alone.
         String windowFieldName = (String) options.windowFieldName
@@ -942,6 +973,13 @@ class OmsRestSourceSupport {
         int maxPageCount = Math.max(1, normalizeInt(config?.maxOrdersPageCount, MAX_ORDERS_PAGE_COUNT))
         int fetchConcurrency = resolveOrdersFetchConcurrency(config)
 
+        // The recon endpoint tells the client when to stop, so none of the inference below applies
+        // to it: no strategy probing, no truncation probe, no shrinking/repeated-page heuristics.
+        if (normalizeExtractOptions(extractOptions).reconEndpoint as boolean) {
+            return extractAllReconOrderPages(endpointUrl, fromMillis, thruMillis, headers, config, warnings,
+                    pageConsumer, keepFieldSet, excludeRules, extractOptions, pageSize, maxPageCount)
+        }
+
         for (Map<String, Object> strategy : PAGINATION_STRATEGIES) {
             Map<String, Object> firstPage = prepareOrdersPage(endpointUrl, fromMillis, thruMillis,
                     pageQueryParams(strategy, 0, pageSize), headers, config, warnings, keepFieldSet, excludeRules,
@@ -1053,6 +1091,66 @@ class OmsRestSourceSupport {
     }
 
     /**
+     * Pagination for /rest/s1/oms/reconciliationOrders, which reports `hasMore` and a window-wide
+     * `ordersCount` instead of leaving termination to be inferred.
+     *
+     * Deliberately sequential. `hasMore` is only known once a page has come back, so pages cannot be
+     * speculatively prefetched the way the legacy loop does — but that loop's concurrency existed to
+     * offset ~84 round-trips caused by a 50-record server cap, and honouring pageSize removes the
+     * round-trips rather than hiding them. Computing a page count from `ordersCount` up front would
+     * restore prefetching; it is left out of this first cut because a total that drifts mid-window
+     * would then silently truncate, and `hasMore` cannot.
+     */
+    protected static Map<String, Object> extractAllReconOrderPages(String endpointUrl, Long fromMillis, Long thruMillis,
+                                                                   Map<String, String> headers, Map config,
+                                                                   List<String> warnings, Closure pageConsumer,
+                                                                   Set<String> keepFieldSet,
+                                                                   List<Map<String, Object>> excludeRules,
+                                                                   Map<String, Object> extractOptions,
+                                                                   int pageSize, int maxPageCount) {
+        // The endpoint declares pageIndex/pageSize; the viewIndex/viewSize fallback is a legacy-OMS
+        // concern and probing it here would only re-issue a rejected request under other names.
+        Map<String, Object> strategy = PAGINATION_STRATEGIES[0]
+        List<Map<String, Object>> pageMetas = []
+        Map<String, Object> serverCounts = [:]
+        int rawFetchedCount = 0
+        int pageIndex = 0
+
+        while (pageIndex < maxPageCount) {
+            Map<String, Object> page = prepareOrdersPage(endpointUrl, fromMillis, thruMillis,
+                    pageQueryParams(strategy, pageIndex, pageSize), headers, config, warnings, keepFieldSet,
+                    excludeRules, extractOptions)
+            pageMetas.add(pageMeta(page))
+            // Every failure is terminal. A rejected pageSize (RQ-25) in particular must reach the
+            // operator with the server's stated limit rather than be routed around silently.
+            if (!page.success) return failedPageResult(page, pageMetas)
+
+            // Window-wide totals repeat on every page; the first page's copy is the authoritative one
+            // and is the only one guaranteed to exist (a window with no orders yields no other page).
+            if (pageIndex == 0) serverCounts = (Map<String, Object>) (page.serverCounts ?: [:])
+
+            if ((int) page.rawCount > 0) {
+                pageConsumer.call(page)
+                rawFetchedCount += (int) page.rawCount
+            }
+            if (!(page.hasMore as boolean)) {
+                return successfulPageResult(strategy, pageSize, pageMetas, rawFetchedCount) +
+                        [serverCounts: serverCounts]
+            }
+            pageIndex++
+        }
+
+        return [
+                errors                  : ["OMS reconciliationOrders pagination exceeded ${maxPageCount} pages for the selected time period.".toString()],
+                statusCode              : latestStatusCode(pageMetas),
+                attemptCount            : totalAttemptCount(pageMetas),
+                retriedWithTrailingSlash: anyTrailingSlashRetry(pageMetas),
+                pagination              : paginationMetadata(strategy, pageSize, pageMetas, rawFetchedCount, true),
+                serverCounts            : serverCounts,
+        ]
+    }
+
+    /**
      * Fetches one page and converts it to a compact "page bundle" on the calling thread:
      * pre-filtered records serialized to comma-joined JSON text, plus counts and a raw-content
      * hash for the repeated-page guard. The parsed record graph never leaves this method, which
@@ -1088,6 +1186,9 @@ class OmsRestSourceSupport {
                 retriedWithTrailingSlash  : page.retriedWithTrailingSlash,
                 rawCount                  : rawRecords.size(),
                 rawHash                   : rawRecords.hashCode(),
+                // Present only in recon mode; the legacy loop never reads them.
+                hasMore                   : page.hasMore,
+                serverCounts              : page.serverCounts,
                 filteredCount             : filtered.size(),
                 excludedNonSalesOrderCount: pageFilter.excludedNonSalesOrderCount,
                 excludedExchangeOrderCount: pageFilter.excludedExchangeOrderCount,
@@ -1172,9 +1273,26 @@ class OmsRestSourceSupport {
             return pageFailure(0, attemptCount, retriedWithTrailingSlash, "OMS REST request failed: ${e.message}")
         }
 
+        boolean reconEndpoint = normalizeExtractOptions(extractOptions).reconEndpoint as boolean
+
         Integer statusCode = normalizeInt(response.statusCode, 0)
         if (statusCode < 200 || statusCode >= 300) {
-            return pageFailure(statusCode, attemptCount, retriedWithTrailingSlash, "OMS REST request failed with status ${statusCode}.")
+            // Recon mode quotes the server's own error code and message, because its failures are
+            // designed to be actionable (PAGE_SIZE_TOO_LARGE names the limit to drop to). The legacy
+            // message is left exactly as it was — that endpoint has no such contract.
+            String detail = reconEndpoint ? describeEndpointError(response.body) : null
+            if (detail == null) {
+                return pageFailure(statusCode, attemptCount, retriedWithTrailingSlash,
+                        "OMS REST request failed with status ${statusCode}.")
+            }
+            // Name the knob. The server states its own maximum, but nothing in that message tells an
+            // operator WHERE to change it on the Darpan side, and the whole reason this is an error
+            // rather than a silent cap is so it can be acted on.
+            String remedy = detail.contains(PAGE_SIZE_TOO_LARGE_CODE)
+                    ? " Lower ordersPageSize on this OMS source config to at or below the stated maximum."
+                    : ""
+            return pageFailure(statusCode, attemptCount, retriedWithTrailingSlash,
+                    "OMS REST request failed with status ${statusCode}: ${detail}${remedy}")
         }
 
         Object parsed
@@ -1191,13 +1309,63 @@ class OmsRestSourceSupport {
             }
         }
 
-        return [
+        Map<String, Object> pageResult = [
                 success   : true,
                 statusCode: statusCode,
                 attemptCount: attemptCount,
                 retriedWithTrailingSlash: retriedWithTrailingSlash,
                 records   : extractOrderRecords(parsed, warnings),
         ]
+        if (reconEndpoint) {
+            // hasMore is the ONLY termination signal on this path — the legacy shrinking-page and
+            // repeated-page heuristics are deliberately not run. Absence therefore cannot be read as
+            // "false": that would end the window after this page and report SUCCESS on a partial
+            // extract, indistinguishable from a window that genuinely held one page. Fail instead,
+            // for the same reason the state-extract ceiling fails rather than truncates.
+            Object rawHasMore = parsed instanceof Map ? ((Map) parsed).get("hasMore") : null
+            if (rawHasMore == null) {
+                return pageFailure(statusCode, attemptCount, retriedWithTrailingSlash,
+                        "OMS reconciliationOrders response carried no hasMore flag, so the end of the " +
+                        "window cannot be determined; refusing to report a possibly-partial extract as complete.")
+            }
+            pageResult.hasMore = normalizeBool(rawHasMore)
+            pageResult.serverCounts = readReconServerCounts(parsed)
+        }
+        return pageResult
+    }
+
+    /** Window-wide counts the recon endpoint reports alongside the page. Absent keys stay absent. */
+    protected static Map<String, Object> readReconServerCounts(Object parsed) {
+        if (!(parsed instanceof Map)) return [:]
+        Map source = (Map) parsed
+        Map<String, Object> counts = [:]
+        for (String key : ["ordersCount", "exchangeOrderCount", "excludedNonSalesOrderCount", "missingExternalIdCount"]) {
+            Integer value = normalizeInt(source.get(key))
+            if (value != null) counts.put(key, value)
+        }
+        return counts
+    }
+
+    /**
+     * The server's own error code / message from a non-2xx recon response, or null when the body is
+     * absent, unparseable, or carries neither. Best-effort by design: the endpoint's error envelope
+     * is not yet verified against a live response, so several shapes are accepted rather than one.
+     */
+    protected static String describeEndpointError(Object rawBody) {
+        String body = normalize(rawBody)
+        if (!body) return null
+        Object parsed
+        try {
+            parsed = new JsonSlurper().parseText(body)
+        } catch (Exception ignored) {
+            return null
+        }
+        if (!(parsed instanceof Map)) return null
+        Map source = (Map) parsed
+        String code = normalize(source.get("errorCode") ?: source.get("code"))
+        String message = normalize(source.get("message") ?: source.get("errorMessage") ?: source.get("error"))
+        if (code && message) return "${code} — ${message}".toString()
+        return code ?: message
     }
 
     private static Map<String, Object> pageFailure(int statusCode, int attemptCount, boolean retriedWithTrailingSlash, String error) {
@@ -1395,6 +1563,10 @@ class OmsRestSourceSupport {
         Map<String, Object> options = normalizeExtractOptions(extractOptions)
         String orderTypeId = (String) options.orderTypeId
         boolean applyExchangeExclusion = options.applyExchangeExclusion as boolean
+        // On the recon endpoint the server has already dropped non-sales orders, and its fixed
+        // projection does not carry orderTypeId at all — so re-running the client-side type filter
+        // would classify every delivered record as non-comparable and extract nothing.
+        boolean reconEndpoint = options.reconEndpoint as boolean
 
         List filteredRecords = []
         List excludedExchangeOrders = []
@@ -1405,8 +1577,14 @@ class OmsRestSourceSupport {
             // Order is load-bearing: the two built-in exclusions keep priority so their counts never
             // shift when a tenant adds a configured rule, and a record excluded by more than one
             // reason is attributed to exactly one bucket.
-            if (!isRequestedOrderType(record, orderTypeId)) {
+            if (!reconEndpoint && !isRequestedOrderType(record, orderTypeId)) {
                 excludedNonSalesOrderCount++
+            } else if (reconEndpoint && isInlineExchangeOrder(record)) {
+                // The endpoint KEEPS exchange orders (flagged) where the legacy client EXCLUDED
+                // them. Dropping them here is what preserves diff parity with the legacy path:
+                // left in, they would show as orders present in OMS and absent from Shopify.
+                excludedExchangeOrderCount++
+                excludedExchangeOrders.add(reconExchangeManifestEntry((Map) record))
             } else if (applyExchangeExclusion && containsExchangeOrderAssociation(record)) {
                 excludedExchangeOrderCount++
                 excludedExchangeOrders.add(exchangeManifestEntry((Map) record))
@@ -1435,7 +1613,8 @@ class OmsRestSourceSupport {
                                                              boolean exchangeManifestTruncated,
                                                              List<Map<String, Object>> excludeRules,
                                                              Map<Integer, Integer> excludedByRuleCounts,
-                                                             Map<String, Object> stateExtract = null) {
+                                                             Map<String, Object> stateExtract = null,
+                                                             Map<String, Object> serverCounts = null) {
         Map<String, Object> filters = [
                 requiredOrderTypeId          : SALES_ORDER_TYPE_ID,
                 excludedNonSalesOrderCount   : excludedNonSalesOrderCount,
@@ -1459,6 +1638,25 @@ class OmsRestSourceSupport {
         // Absent rather than empty for a windowed extract, matching configuredExclusions above: a
         // block that appeared for every extract would read as "this always applies".
         if (stateExtract != null) filters.stateExtract = stateExtract
+
+        // Recon endpoint: the SALES_ORDER filter and the empty-join-key drop run server-side, so the
+        // client's own non-sales counter is structurally zero. Report the server's number under the
+        // SAME key, so RQ-3 exclusion visibility survives the move and a filtering bug on either side
+        // stays detectable. excludedExchangeOrderCount is deliberately NOT overridden: exchanges
+        // arrive inline and are dropped by this client, so its own count is the accurate one.
+        if (serverCounts) {
+            if (serverCounts.containsKey("excludedNonSalesOrderCount")) {
+                filters.excludedNonSalesOrderCount = serverCounts.get("excludedNonSalesOrderCount")
+            }
+            // No legacy equivalent: the legacy path delivers empty-keyed orders into the compare,
+            // where they collide on the join. Surfacing the count is how that difference stays visible.
+            if (serverCounts.containsKey("missingExternalIdCount")) {
+                filters.missingExternalIdCount = serverCounts.get("missingExternalIdCount")
+            }
+            if (serverCounts.containsKey("ordersCount")) {
+                filters.serverReportedOrdersCount = serverCounts.get("ordersCount")
+            }
+        }
         return filters
     }
 
@@ -1472,6 +1670,41 @@ class OmsRestSourceSupport {
                 grandTotal: record.get('grandTotal'),
                 orderDate : record.get('orderDate'),
                 statusId  : normalize(record.get('statusId')),
+        ]
+    }
+
+    /**
+     * Whether a recon-endpoint record is an exchange order. The endpoint states this inline on a
+     * fixed field rather than leaving it to be inferred from an order-item association graph, so
+     * this is a flag read — not the recursive {@link #containsExchangeOrderAssociation} walk.
+     */
+    protected static boolean isInlineExchangeOrder(Object record) {
+        if (!(record instanceof Map)) return false
+        Object flag = ((Map) record).find { key, ignored ->
+            normalize(key) == RECON_EXCHANGE_FLAG_FIELD
+        }?.value
+        return normalizeBool(flag)
+    }
+
+    /**
+     * Exchange-manifest entry built from the recon endpoint's inline linkage fields.
+     *
+     * This is the reason the recon endpoint removes the exchange-pair lookup bottleneck: the legacy
+     * path knows only the excluded order's own identity and has to resolve its counterpart with a
+     * per-id point lookup (capped at 50 per run — DAR-BE-011/012), whereas originalOrderId and
+     * originalExternalId arrive on the record itself. Same key names as the legacy entry so the
+     * sidecar's consumers are unchanged; originalExternalId is additive.
+     */
+    protected static Map<String, Object> reconExchangeManifestEntry(Map record) {
+        return [
+                omsOrderId        : normalize(record.get('orderId')),
+                externalId        : normalize(record.get('externalId')),
+                orderName         : normalize(record.get('orderName')),
+                toOrderId         : normalize(record.get('originalOrderId')),
+                originalExternalId: normalize(record.get('originalExternalId')),
+                grandTotal        : record.get('grandTotal'),
+                orderDate         : record.get('orderDate'),
+                statusId          : normalize(record.get('statusId')),
         ]
     }
 
@@ -1544,14 +1777,21 @@ class OmsRestSourceSupport {
                 .collect { Object value -> normalize(value) }
                 .findAll { String value -> value } as List<String>
 
+        // The reconciliationOrders endpoint filters, projects and counts server-side, so the whole
+        // client-side comparability pass changes meaning (see filterComparableOrderRecords).
+        boolean reconEndpoint = normalizeBool(raw.get("reconEndpoint"))
+
         // The EXCHANGE order-item-association scan exists to keep exchange sales orders out of the
         // sales-order comparison. It is meaningless on any other order type, where it would only cost
-        // a full-document walk per record.
+        // a full-document walk per record — and equally meaningless on the recon endpoint, whose
+        // fixed projection carries no orderItemAssocs to scan. There, an inline `isExchange` flag
+        // replaces the scan.
         boolean applyExchangeExclusion = raw.containsKey("applyExchangeExclusion")
                 ? normalizeBool(raw.get("applyExchangeExclusion"))
-                : SALES_ORDER_TYPE_ID.equalsIgnoreCase(orderTypeId)
+                : (!reconEndpoint && SALES_ORDER_TYPE_ID.equalsIgnoreCase(orderTypeId))
 
         return [
+                reconEndpoint            : reconEndpoint,
                 orderTypeId              : orderTypeId,
                 windowFieldName          : windowFieldName,
                 orderStatusIds           : orderStatusIds,

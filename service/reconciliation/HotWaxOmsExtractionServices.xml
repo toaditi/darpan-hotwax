@@ -78,6 +78,97 @@
         </out-parameters>
     </service>
 
+    <service verb="extract" noun="HotWaxOmsReconciliationOrders" type="script" transaction="ignore" allow-remote="false" authenticate="true"
+            location="component://darpan-hotwax/src/main/groovy/darpan/hotwax/reconciliation/automation/extractOmsReconciliationOrders.groovy">
+        <description>Extract HotWax OMS orders for an automation window from the purpose-built
+            /rest/s1/oms/reconciliationOrders endpoint, writing normalized JSON output to the
+            automation data-manager folder. Same in/out contract and same on-disk file shape as
+            extract#HotWaxOmsOrders, so the automation edge and the Spark compare stage are unchanged;
+            the endpoint differs in that it filters to comparison-eligible sales orders server-side,
+            projects to a fixed field set, honours pageSize, and reports hasMore/ordersCount instead
+            of leaving termination to be inferred.
+
+            A distinct service name from extract#HotWaxOmsOrders is required because the connector
+            registry resolves a connector row by its extract service name. Adoption is opt-in: a rule
+            set moves to this connector by pointing its source at sourceConfigType
+            HOTWAX_OMS_REST_RECON, against the same HotWaxOmsRestSourceConfig row.
+
+            GATING: the endpoint returns a fixed field set, so before enabling this connector for a
+            rule set, verify that rule set's join key and every field-comparison field fall inside
+            {orderId, externalId, orderName, grandTotal, orderDate, statusId}. A rule set needing any
+            other field must stay on extract#HotWaxOmsOrders.</description>
+        <in-parameters>
+            <parameter name="omsRestSourceConfigId" required="true">
+                <description>Tenant-owned HotWaxOmsRestSourceConfig identifier. Reuses the same OMS
+                    credentials and baseUrl as sales-order extraction; only the path differs, and the
+                    path is fixed by the extractor rather than read from the config's ordersPath.</description>
+            </parameter>
+            <parameter name="automationExecutionId">
+                <description>Automation execution id used to choose the default data-manager output folder.</description>
+            </parameter>
+            <parameter name="companyUserGroupId">
+                <description>Trusted automation owner tenant. When present, config access is checked against this tenant instead of a user-session active tenant.</description>
+            </parameter>
+            <parameter name="windowStart" required="true">
+                <description>Start of the automation window; accepts Timestamp, Date, ISO-8601 text, SQL timestamp text, or epoch milliseconds. Sent as the half-open lower bound orderDateFrom.</description>
+            </parameter>
+            <parameter name="windowEnd" required="true">
+                <description>End of the automation window, same accepted formats as windowStart. Sent
+                    as orderDateThru, which the endpoint treats as EXCLUSIVE — an order timestamped
+                    exactly at the bound belongs to the next window, so consecutive chunks do not
+                    double-count their boundary.</description>
+            </parameter>
+            <parameter name="outputLocation">
+                <description>Optional output directory. Defaults to runtime://datamanager/reconciliation-runs/{automationExecutionId}/{timestamp}/.</description>
+            </parameter>
+            <parameter name="fileName">
+                <description>Optional output file name. Defaults to oms-orders-{fromMillis}-{thruMillis}.json, matching the legacy extractor so saved-run file-side matching is unaffected.</description>
+            </parameter>
+            <parameter name="keepRecordFields" type="List">
+                <parameter name="fieldName"/>
+                <description>Optional projection: top-level record fields to keep in the output file.
+                    Normally a no-op here because the endpoint already projects server-side; retained
+                    so the parameter contract matches extract#HotWaxOmsOrders and so a caller asking
+                    for a narrower set than the endpoint's still gets it.</description>
+            </parameter>
+            <parameter name="sourceFilters" type="List">
+                <parameter name="filterRule" type="Map">
+                    <parameter name="sequenceNum" type="Integer"/>
+                    <parameter name="fieldExpression"/>
+                    <parameter name="operator"/>
+                    <parameter name="filterValues"/>
+                </parameter>
+                <description>Optional record-exclusion rules, same semantics as extract#HotWaxOmsOrders.
+                    These stay client-side on this connector too: the endpoint has no knowledge of
+                    tenant exclusion rules, so matching runs in the extractor before output.</description>
+            </parameter>
+            <parameter name="reconciliationRunResultId">
+                <description>Optional observability run id for progress heartbeats. Advisory only.</description>
+            </parameter>
+            <parameter name="progressStageCode">
+                <description>Which extract stage this run is: EXTRACT_FILE1 or EXTRACT_FILE2. Defaults to EXTRACT_FILE2.</description>
+            </parameter>
+            <parameter name="expectedRecordCount" type="Integer">
+                <description>Optional expected total, which adds a progress percent alongside the count.</description>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="dataAvailable" type="Boolean"/>
+            <parameter name="fileLocation"/>
+            <parameter name="exchangeManifestFileLocation">
+                <description>Location of the exchange-manifest sidecar written when the window
+                    contained exchange orders; null otherwise. Same shape and same 500-entry cap as
+                    the legacy extractor, but built from the endpoint's inline originalOrderId /
+                    originalExternalId fields, so it costs no pair-lookup round-trips.</description>
+            </parameter>
+            <parameter name="fileName"/>
+            <parameter name="recordCount" type="Integer"/>
+            <parameter name="requestMetadata" type="Map"/>
+            <parameter name="warnings" type="List"/>
+            <parameter name="errors" type="List"/>
+        </out-parameters>
+    </service>
+
     <service verb="extract" noun="HotWaxOmsTransferOrders" type="script" transaction="ignore" allow-remote="false" authenticate="true"
             location="component://darpan-hotwax/src/main/groovy/darpan/hotwax/reconciliation/automation/extractOmsTransferOrders.groovy">
         <description>Extract HotWax OMS transfer orders (orderTypeId=TRANSFER_ORDER) by date window and/or
