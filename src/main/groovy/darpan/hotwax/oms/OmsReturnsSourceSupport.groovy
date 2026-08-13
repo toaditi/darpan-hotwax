@@ -6,6 +6,7 @@ import groovy.json.JsonSlurper
 import darpan.reconciliation.source.SourceFilterSupport
 
 import static darpan.common.ValueSupport.normalize
+import static darpan.common.ValueSupport.normalizeBool
 import static darpan.common.ValueSupport.normalizeInt
 
 /**
@@ -171,12 +172,33 @@ class OmsReturnsSourceSupport {
                     if (retainRecords) collected.add(projected)
                 }
 
-                serverCounts.put("returnsCount", normalizeInt(body.get("returnsCount"), 0))
-                serverCounts.put("excludedNoShopifyRefCount", normalizeInt(body.get("excludedNoShopifyRefCount"), 0))
+                // M1: window-wide totals repeat on every page; the first page's copy is the
+                // authoritative one and is the only one guaranteed to exist (a window with no
+                // returns yields no other page) — mirrors OmsRestSourceSupport.extractOrdersInternal
+                // (:1169-1171), whose own comment states this explicitly. The endpoint's actual
+                // per-page repetition semantics are unobserved (no live response captured yet, per
+                // this class's own doc); first-page-wins is the same conservative assumption the
+                // orders sibling makes, not a verified contract.
+                if (pageIndex == 0) {
+                    serverCounts.put("returnsCount", normalizeInt(body.get("returnsCount"), 0))
+                    serverCounts.put("excludedNoShopifyRefCount", normalizeInt(body.get("excludedNoShopifyRefCount"), 0))
+                }
 
                 if (pageProgressListener != null) pageProgressListener.call(cumulativeRaw)
 
-                hasMore = body.get("hasMore") == true
+                // C4: hasMore is the ONLY termination signal here (this endpoint has none of the
+                // legacy orders-path shrinking-page/repeated-page heuristics — see class doc).
+                // Absence therefore cannot be read as "false": that would end the window after this
+                // page and report SUCCESS on a partial extract, indistinguishable from a window that
+                // genuinely held one page. Fail instead, mirroring OmsRestSourceSupport's own
+                // recon-endpoint handling (:1361-1372) exactly, including using normalizeBool (not a
+                // strict `== true`) for a present-but-stringly-typed value such as "true".
+                Object rawHasMore = body.get("hasMore")
+                if (rawHasMore == null) {
+                    errors.add("OMS returns response carried no hasMore flag, so the end of the window cannot be determined; refusing to report a possibly-partial extract as complete.".toString())
+                    break
+                }
+                hasMore = normalizeBool(rawHasMore)
                 pageIndex++
             }
             // finish() must never run on an error-triggered break out of the loop above — it would

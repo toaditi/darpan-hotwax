@@ -74,6 +74,82 @@ class OmsReturnsExtractTests {
         assertEquals(2, result.recordCount)
     }
 
+    // --- C4: hasMore must be the sole, trustworthy termination signal --------------------------
+    //
+    // OmsRestSourceSupport's own recon-endpoint handling (:1361-1372) spells out why an absent
+    // hasMore cannot be read as false: "that would end the window after this page and report
+    // SUCCESS on a partial extract, indistinguishable from a window that genuinely held one page."
+    // Before this fix, `body.get("hasMore") == true` silently stopped after page 1 on both an
+    // absent flag and a stringly-typed "true", reporting success on a partial window.
+
+    @Test
+    void anAbsentHasMoreFlagFailsRatherThanSilentlyEndingTheWindow() {
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            Map body = [returns: [returnRecord("1001", "5001")], returnsCount: 1, pageIndex: 0,
+                        pageSize: 500, excludedNoShopifyRefCount: 0]
+            // Deliberately no "hasMore" key at all.
+            return [statusCode: 200, body: JsonOutput.toJson(body)]
+        }
+
+        Map result = OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, null, [:])
+
+        assertFalse((result.errors as List).isEmpty(),
+                "an absent hasMore flag must be reported as an error, not silently treated as the end of the window")
+        assertTrue((result.errors as List).join(" ").toLowerCase().contains("hasmore"),
+                "the error must name hasMore so an operator can act on it: ${result.errors}")
+    }
+
+    @Test
+    void aStringHasMoreValueOfTrueKeepsPaging() {
+        // A present-but-stringly-typed "true" must be interpreted as boolean true (normalizeBool),
+        // not fall through a strict `== true` check that only a real Boolean can satisfy.
+        int callCount = 0
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            callCount++
+            if (callCount == 1) {
+                Map body = [returns: [returnRecord("1001", "5001")], returnsCount: 1, hasMore: "true",
+                            pageIndex: 0, pageSize: 500, excludedNoShopifyRefCount: 0]
+                return [statusCode: 200, body: JsonOutput.toJson(body)]
+            }
+            return [statusCode: 200, body: returnsBody([returnRecord("1002", "5002")], false)]
+        }
+
+        Map result = OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, null, [:])
+
+        assertEquals(2, callCount, "a string \"true\" hasMore value must still trigger a second page fetch")
+        assertTrue((result.errors as List).isEmpty(), result.errors.toString())
+        assertEquals(2, result.recordCount)
+    }
+
+    // --- M1: window-wide server counts are first-page-wins, not last-page-overwrites -----------
+
+    @Test
+    void serverCountsAreTakenFromTheFirstPageNotOverwrittenByLaterPages() {
+        int callCount = 0
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            callCount++
+            if (callCount == 1) {
+                return [statusCode: 200, body: returnsBody([returnRecord("1001", "5001")], true,
+                        [returnsCount: 7, excludedNoShopifyRefCount: 3])]
+            }
+            // A later page reports different (e.g. stale or per-page) totals — must NOT win.
+            return [statusCode: 200, body: returnsBody([returnRecord("1002", "5002")], false,
+                    [returnsCount: 1, excludedNoShopifyRefCount: 0])]
+        }
+
+        Map result = OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, null, [:])
+
+        assertEquals(2, callCount)
+        Map filters = (Map) ((Map) result.requestMetadata).get("filters")
+        assertEquals(7, filters.get("serverReportedReturnsCount"),
+                "the first page's window-wide count must be authoritative, not overwritten by page 2")
+        assertEquals(3, filters.get("excludedNoShopifyRefCount"),
+                "the first page's window-wide count must be authoritative, not overwritten by page 2")
+    }
+
     @Test
     void preservesNestedItemsOnEachReturnRecord() {
         OmsReturnsSourceSupport.setHttpClient { Map request ->
