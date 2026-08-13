@@ -254,6 +254,19 @@ right second position, or does OMS identify a return line by
 second position changes to whatever identifier Shopify can also produce — this
 must be a value both systems independently carry, not an OMS-internal sequence.
 
+**OQ-9 resolved (2026-08-12):** `sku`. It is the only candidate both systems
+independently carry — `returnItemSeqId` is OMS-internal (not something Shopify
+has any concept of), and `orderItemExternalId` references an *order* item, not a
+return line, so it identifies the wrong object. This closes the question without
+needing an OMS answer; see the design doc's gating-verification pass (§9.3 of
+`roadmap/handoffs/2026-08-12-DAR-BE-018-returns-identity-design.md`). Two
+caveats this resolution does **not** close: the Shopify-side
+`returnLineItems[].fulfillmentLineItem.lineItem.sku` path is still unverified
+against a live return (only order-line and exchange-line `sku` selections are
+proven), and SKU is not guaranteed unique per return line — a duplicate
+⟨header, SKU⟩ collision is a phase-2 design decision, not resolved by this
+answer.
+
 ### 5.2 Required field set — return header
 
 | Field | Purpose | Notes |
@@ -317,6 +330,22 @@ candidate — the OMS filters them out server-side and reports the excluded coun
 separately, exactly as RQ-1 and RQ-3 do for orders. **OQ-10:** which categories
 are these, and what distinguishes them? Darpan cannot specify this filter without
 knowing the OMS return taxonomy.
+
+**OQ-10 is now a decision, not just an open question (2026-08-12).** Phase 1
+already ships a client-side answer to the same problem: a `returnChannelEnumId`
+exclusion pill on the `OMS_RETURNS` connector (`rest-return-extraction.md`,
+"Configurable record exclusion"), reusing the same
+`darpan.reconciliation.source.SourceFilterSupport` mechanism orders use. If the
+OMS later implements RQ-24's server-side channel filter, that **retires** the
+client-side pill rather than layering under it — they are alternative
+placements of the identical rule, not two independent filters. Running both
+would not double-exclude anything (the two would simply agree), but the
+client-side pill would degrade to a permanent no-op filtering an
+already-filtered population, exactly the "matched nothing, no error" trap the
+pill mechanism otherwise guards against. Whoever answers OQ-10 must also decide
+**where the rule lives** — OMS-side (RQ-24) or Darpan-side (the pill) — not
+both. See the design doc's §5 ("Tension with RQ-24 — alternative placements,
+not layers") for the full analysis.
 
 ## 6. Cross-cutting endpoint requirements
 
@@ -435,8 +464,8 @@ Explicit non-requirements, recorded so nobody builds them by accident:
 | OQ-6 | Is there a concurrency limit on these endpoints per tenant or credential? Darpan's automation can run several tenants' windows in parallel. | RQ-32 | Carried forward, unanswered |
 | OQ-7 | Maximum requestable window size? Must be ≥ 28 days; reject-with-error strongly preferred over auto-split. | RQ-12 | Carried forward, unanswered |
 | OQ-8 | **Does the OMS return record store a reference to its Shopify `Return`? If so, which field and in what format?** Blocking for return-header reconciliation. | §5.1 | New |
-| OQ-9 | How does OMS identify a return line — SKU, or an internal sequence with SKU as an attribute? The composite key's second position must be a value both systems independently carry. | §5.1 | New |
-| OQ-10 | Which categories of OMS return are not comparison-eligible against Shopify, and what distinguishes them? | RQ-24 | New |
+| OQ-9 | How does OMS identify a return line — SKU, or an internal sequence with SKU as an attribute? The composite key's second position must be a value both systems independently carry. | §5.1 | **Resolved 2026-08-12 — `sku`**, by elimination (`returnItemSeqId` is OMS-internal; `orderItemExternalId` identifies the wrong object). No OMS answer needed. Shopify-side return-line `sku` path still unverified; SKU-uniqueness collision still a phase-2 decision. |
+| OQ-10 | Which categories of OMS return are not comparison-eligible against Shopify, and what distinguishes them? | RQ-24 | **Decision, not just a question, as of 2026-08-12.** Phase 1 ships a client-side `returnChannelEnumId` pill answering the same problem; implementing RQ-24 server-side would retire that pill (alternative placements of one rule, not two layers — see §5.5 and design doc §5). The OMS taxonomy answer is still needed to know *which values*, but the placement question is now Darpan's to decide, not the OMS's. |
 | OQ-11 | What is the maximum page size the endpoints can honour, and the maximum number of `externalId` values per batch request? | RQ-25, RQ-31 | New |
 | OQ-12 | Is the 50-record cap a deployment configuration or built into the endpoint? Determines whether existing deployments can be fixed by config ahead of any new endpoint. | RQ-25 | New |
 
