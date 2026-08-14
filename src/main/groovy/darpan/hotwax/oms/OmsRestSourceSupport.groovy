@@ -4,6 +4,7 @@ import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 
 import darpan.facade.common.SharedConfigAccessSupport
+import darpan.reconciliation.automation.SourceEndpointAccessSupport
 import darpan.reconciliation.source.SourceFilterSupport
 
 import static darpan.common.ValueSupport.boundedInt
@@ -497,7 +498,15 @@ class OmsRestSourceSupport {
      * owner-only check: {@code canTenantUseConfig}/{@code canActiveTenantUseConfig} both reduce to
      * {@code companyUserGroupId == tenant} when nothing is shared.</p>
      */
-    static void requireUsableOmsConfig(def ec, def sourceConfig, String configId, String automationTenantUserGroupId) {
+    /**
+     * @param requiredSystemEnumId endpoint the caller is about to extract from, e.g. OMS_RETURNS.
+     *        Null means "no endpoint check" and preserves pre-DAR-BE-019 behaviour for callers that
+     *        are not endpoint-specific. The compiler cannot catch a caller naming the WRONG endpoint,
+     *        which is why each seam has its own gate test.
+     */
+    static void requireUsableOmsConfig(def ec, def sourceConfig, String configId,
+                                       String automationTenantUserGroupId,
+                                       String requiredSystemEnumId = null) {
         String trustedTenant = normalize(automationTenantUserGroupId)
         boolean usable = trustedTenant
                 ? SharedConfigAccessSupport.canTenantUseConfig(ec,
@@ -506,6 +515,13 @@ class OmsRestSourceSupport {
                         SharedConfigAccessSupport.CONFIG_TYPE_HOTWAX_OMS, sourceConfig)
         if (!usable) {
             ec.message.addError("OMS REST source config ${configId} not found.".toString())
+            return
+        }
+
+        String requiredEndpoint = normalize(requiredSystemEnumId)
+        if (requiredEndpoint && !SourceEndpointAccessSupport.isEndpointEnabled(ec,
+                SharedConfigAccessSupport.CONFIG_TYPE_HOTWAX_OMS, configId, requiredEndpoint)) {
+            ec.message.addError("OMS REST source config ${configId} is not enabled for ${requiredEndpoint}.".toString())
         }
     }
 
