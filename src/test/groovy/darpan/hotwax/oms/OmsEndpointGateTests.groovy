@@ -10,6 +10,7 @@ import org.junit.jupiter.api.TestInstance
 import org.moqui.context.ExecutionContext
 
 import java.nio.file.Path
+import java.sql.Timestamp
 
 import static org.junit.jupiter.api.Assertions.assertFalse
 import static org.junit.jupiter.api.Assertions.assertTrue
@@ -82,5 +83,42 @@ class OmsEndpointGateTests {
     void omittedEndpointKeepsLegacyBehaviour() {
         // Existing callers that pass no endpoint must behave exactly as before this change.
         assertFalse(rejects(null))
+    }
+
+    // --- Task 16: proves the WIRING at a real production call site, not just the chokepoint above.
+    //
+    // extractOmsReturns.groovy currently calls requireUsableOmsConfig with NO 5th argument at all, so
+    // this test is red before Task 16 wires "OMS_RETURNS" into that call: the extraction gate never
+    // fires and the (faked) 200 response is accepted, dataAvailable=false/errors=[] for an empty page
+    // rather than a refusal. A fake HTTP client keeps both the red and green runs deterministic and
+    // network-free — without it a red run would fall through the gate and attempt a real request to
+    // the fixture's bogus baseUrl.
+
+    @Test
+    void extractOmsReturnsPathRefusesWhenOmsReturnsEndpointDisabled() {
+        OmsRestSourceSupport.setHttpClient { Map ignored ->
+            [statusCode: 200, body: '{"returns":[],"hasMore":false,"returnsCount":0,"excludedNoShopifyRefCount":0}']
+        }
+        try {
+            ec.message.clearErrors()
+            Map<String, Object> result = (Map<String, Object>) ec.service.sync()
+                    .name("reconciliation.HotWaxOmsExtractionServices.extract#HotWaxOmsReturns")
+                    .parameters([
+                            omsRestSourceConfigId: CONFIG_ID,
+                            companyUserGroupId   : TENANT,
+                            windowStart          : Timestamp.valueOf("2026-05-01 00:00:00"),
+                            windowEnd            : Timestamp.valueOf("2026-05-02 00:00:00"),
+                            outputLocation       : "runtime://tmp/oms-endpoint-gate-extract-returns-test",
+                    ])
+                    .disableAuthz()
+                    .call()
+            List<String> errors = (result?.errors ?: []) as List<String>
+            assertTrue(errors.any { it.contains("not enabled for OMS_RETURNS") },
+                    "extract#HotWaxOmsReturns must refuse when this config's OMS_RETURNS endpoint is disabled: ${errors}")
+            assertFalse(result?.dataAvailable as boolean)
+        } finally {
+            OmsRestSourceSupport.resetHttpClient()
+            ec.message.clearErrors()
+        }
     }
 }

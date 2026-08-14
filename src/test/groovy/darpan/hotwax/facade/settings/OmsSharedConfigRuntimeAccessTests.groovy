@@ -61,6 +61,12 @@ class OmsSharedConfigRuntimeAccessTests {
     void setup() {
         Path backendRoot = ReconciliationSmokeTestSupport.resolveBackendRoot()
         ec = ReconciliationSmokeTestSupport.initMoqui(backendRoot, "hotwax-oms-shared-config-runtime-access")
+        // Task 16: requireUsableOmsConfig's new endpoint gate derives its catalog from
+        // SourceSystemConnector rows (SourceEndpointAccessSupport.listEndpointsForConfig), not just
+        // from SourceConfigEndpointAccess decisions. Without this load the catalog is empty, so
+        // isEndpointEnabled("OMS") is false for every config — not the "absent decision means
+        // enabled" default — and every extract#HotWaxOmsOrders call below is wrongly refused.
+        ReconciliationSmokeTestSupport.loadSeedData(ec, "component://darpan/data/SourceSystemConnectorSeedData.xml")
         ReconciliationSmokeTestSupport.seedCompanyScope(ec)
         seedTenant(OWNER, "Runtime Owner")
         seedTenant(MEMBER, "Runtime Member")

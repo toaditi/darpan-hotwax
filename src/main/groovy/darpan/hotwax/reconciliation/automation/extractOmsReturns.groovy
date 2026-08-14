@@ -26,7 +26,7 @@ def sourceConfig = ec.entity.find("darpan.hotwax.HotWaxOmsRestSourceConfig")
         .useCache(false)
         .one()
 
-OmsRestSourceSupport.requireUsableOmsConfig(ec, sourceConfig, configIdValue, companyUserGroupIdValue)
+OmsRestSourceSupport.requireUsableOmsConfig(ec, sourceConfig, configIdValue, companyUserGroupIdValue, "OMS_RETURNS")
 
 if (sourceConfig && (sourceConfig.isActive ?: "Y").toString().equalsIgnoreCase("N")) {
     ec.message.addError("OMS REST source config ${configIdValue} is inactive.")

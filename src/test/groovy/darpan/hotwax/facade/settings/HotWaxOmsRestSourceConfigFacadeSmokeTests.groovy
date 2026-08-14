@@ -36,6 +36,12 @@ class HotWaxOmsRestSourceConfigFacadeSmokeTests {
     void setup() {
         Path backendRoot = ReconciliationSmokeTestSupport.resolveBackendRoot()
         ec = ReconciliationSmokeTestSupport.initMoqui(backendRoot, "hotwax-oms-rest-source-config-smoke")
+        // Task 16: requireUsableOmsConfig's new endpoint gate derives its catalog from
+        // SourceSystemConnector rows (SourceEndpointAccessSupport.listEndpointsForConfig), not just
+        // from SourceConfigEndpointAccess decisions. Without this load the catalog is empty, so
+        // isEndpointEnabled("OMS") is false for every config — not the "absent decision means
+        // enabled" default — and every extract#HotWaxOmsOrders call below is wrongly refused.
+        ReconciliationSmokeTestSupport.loadSeedData(ec, "component://darpan/data/SourceSystemConnectorSeedData.xml")
         ReconciliationSmokeTestSupport.seedCompanyScope(ec)
         seedPermissionGroup(TenantAccessSupport.DARPAN_COMPANY_VIEW_ONLY_GROUP_ID, "Can view tenant-scoped Darpan data but cannot mutate it")
         replaceTenantPermission(KREWE, TenantAccessSupport.DARPAN_COMPANY_VIEW_ONLY_GROUP_ID)
