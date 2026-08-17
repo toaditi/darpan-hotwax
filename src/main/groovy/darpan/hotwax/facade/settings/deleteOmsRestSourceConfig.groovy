@@ -3,6 +3,7 @@ import darpan.facade.common.SharedConfigAccessSupport
 import darpan.facade.common.SharedConfigGrantSupport
 import darpan.facade.common.TenantAccessSupport
 import darpan.hotwax.oms.OmsRestSourceSupport
+import darpan.reconciliation.automation.SourceEndpointAccessSupport
 
 import static darpan.common.ValueSupport.normalize
 
@@ -68,6 +69,13 @@ if (!ec.message.hasError()) {
 }
 
 if (!ec.message.hasError()) {
+    // SourceConfigEndpointAccess.configId is polymorphic, so nothing cascades. Delete explicitly, or a
+    // later config reusing this id silently inherits this one's disabled endpoints.
+    ec.entity.find(SourceEndpointAccessSupport.ENTITY_NAME)
+            .condition("configTypeEnumId", SharedConfigAccessSupport.CONFIG_TYPE_HOTWAX_OMS)
+            .condition("configId", configId)
+            .deleteAll()
+
     ec.service.sync()
         .name("delete#darpan.hotwax.HotWaxOmsRestSourceConfig")
         .parameters([omsRestSourceConfigId: configId])
