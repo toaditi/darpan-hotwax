@@ -51,6 +51,14 @@ if (!ec.message.hasError()) {
             // pre-Task-7 behavior threw a distinguishing "not available in your active tenant"
             // message for the foreign-owned case here, which let any authenticated caller probe
             // arbitrary ids for existence.
+            //
+            // Task 13 invariant: this "not found" path (config == null included) sets
+            // ec.message.hasError(), which gates the SourceConfigEndpointAccess cleanup below the
+            // same as it gates the entity delete — so a config already gone (deleted out-of-band,
+            // bypassing this service) never has its access rows swept here. That is safe today only
+            // because SourceConfigEndpointAccess is new in this plan (no pre-existing orphans can
+            // exist) and both real delete paths route through this script. An out-of-band delete of
+            // the config row (e.g. direct DB deletion) would still orphan its access rows.
             ec.message.addError("HotWax OMS REST source config '${configId}' was not found.")
         }
     }
