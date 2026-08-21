@@ -343,4 +343,38 @@
         </out-parameters>
     </service>
 
+    <service verb="lookup" noun="HotWaxOmsReturnsByExternalId" type="script" transaction="ignore" allow-remote="false" authenticate="true"
+            location="component://darpan-hotwax/src/main/groovy/darpan/hotwax/reconciliation/lookup/lookupOmsReturnsByExternalId.groovy">
+        <description>Point-existence check for OMS return ids against the reconciliation returns endpoint,
+            the missing-in-OMS mirror of Shopify's lookup#ShopifyRefundOrReturnIds. The saved-run verification
+            pass calls this to confirm or refute "missing in OMS" differences.
+
+            Escapes the run window by construction: OMS windows on entryDate (when a return was CREATED)
+            while the Shopify side windows on the event createdAt (when it was REFUNDED), so a return opened
+            weeks before its refund sits inside one window and far outside the other. Measured 2026-08-20,
+            that mismatch explained 45 of 59 remaining differences, median age 11 days.
+
+            The endpoint honours a CSV externalId filter, so ids are checked in batches, and every returned
+            record is echo-checked against the ids actually requested — a sibling filter (orderExternalId)
+            was proven to be silently ignored while still answering HTTP 200 with an unfiltered corpus.
+            A failed lookup returns ok=false with both id lists empty — it never classifies an id as missing.</description>
+        <in-parameters>
+            <parameter name="omsRestSourceConfigId" required="true">
+                <description>Tenant-owned HotWaxOmsRestSourceConfig identifier.</description>
+            </parameter>
+            <parameter name="externalIds" type="List" required="true">
+                <description>Shopify refund or return ids as they appear in the OMS externalId field.</description>
+            </parameter>
+            <parameter name="companyUserGroupId">
+                <description>Trusted run owner tenant. When present, config access is checked against this tenant instead of a user-session active tenant.</description>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="ok" type="Boolean"/>
+            <parameter name="foundIds" type="List"/>
+            <parameter name="missingIds" type="List"/>
+            <parameter name="errors" type="List"/>
+        </out-parameters>
+    </service>
+
 </services>

@@ -31,6 +31,9 @@ class OmsReturnsSourceSupport {
     static final String RETURN_CHANNEL_FIELD = "returnChannelEnumId"
     static final int DEFAULT_RETURNS_PAGE_SIZE = 500
     static final int MAX_RETURNS_PAGE_COUNT = 20000
+    static final String RETURNS_EXTERNAL_ID_PARAM = "externalId"
+    /** 20 ids per call is the width live-proven 2026-08-20; the endpoint accepts CSV and repeated params. */
+    static final int RETURNS_LOOKUP_CHUNK_SIZE = 20
 
     private static final JsonSlurper JSON_SLURPER = new JsonSlurper()
 
@@ -167,6 +170,7 @@ class OmsReturnsSourceSupport {
                         exclusionCounts.put(key, normalizeInt(exclusionCounts.get(key), 0) + 1)
                         return
                     }
+                    applyJoinKeyFallback(record)
                     Map<String, Object> projected = projectRecord(record, keepRecordFields)
                     sink.write(projected)
                     if (retainRecords) collected.add(projected)
@@ -252,6 +256,113 @@ class OmsReturnsSourceSupport {
         url.append("&pageIndex=").append(pageIndex)
         url.append("&pageSize=").append(pageSize)
         return url.toString()
+    }
+
+    /**
+     * JOIN-KEY FALLBACK (2026-08-20). `externalId` is the returns-pair join key, and OMS leaves it
+     * BLANK until a refund exists — 67 of 772 rows in the 2026-08-20 live run. Those rows reached the
+     * compare with no key at all and could only ever land as false "missing in Shopify" differences.
+     *
+     * The fallback is not a guess: it tracks Shopify's own grain exactly. Shopify emits a RETURN row
+     * while a return is unrefunded and switches to the REFUND row once a refund exists (the
+     * refunded-return narrowing in ShopifyReturnRefsSupport). So an OMS return with no refund yet is
+     * named on the Shopify side by its RETURN id — which is precisely `shopifyReturnId`.
+     *
+     * Measured against the full 772-row run: 283 rows matched a Shopify event via externalId
+     * (268 REFUND / 15 RETURN) and 65 via this fallback (65 RETURN / **0 REFUND**) — the fallback
+     * never once engaged for a refunded event. Zero key collisions, zero rows left keyless.
+     *
+     * Do NOT invert this into "prefer shopifyReturnId": the two fields hold DIFFERENT Shopify objects
+     * for a refunded return (32 of 45 sampled differed — externalId the refund id, shopifyReturnId the
+     * return id), and Shopify suppresses the RETURN row once refunded, so preferring shopifyReturnId
+     * would break every refunded match.
+     */
+    protected static void applyJoinKeyFallback(Map<String, Object> record) {
+        if (record == null) return
+        if (normalize(record.get("externalId"))) return
+        String fallback = normalize(record.get("shopifyReturnId"))
+        if (fallback) record.put("externalId", fallback)
+    }
+
+    /**
+     * Point-existence check for OMS return ids, the missing-in-OMS mirror of Shopify's
+     * lookup#ShopifyRefundOrReturnIds. Returns [ok, foundIds, missingIds, errors] — the contract
+     * MissingDiffVerificationSupport consumes.
+     *
+     * Escapes the run window BY CONSTRUCTION. The endpoint requires window params, but a by-id lookup
+     * must not be narrowed by them: OMS windows on entryDate (when the return was CREATED) while the
+     * Shopify side windows on the refund/return event createdAt (when it was REFUNDED), and a return
+     * opened weeks before its refund is in-window for one and far outside for the other. In the
+     * 2026-08-20 run that clock mismatch accounted for 45 of 59 remaining differences, with a median
+     * age of 11 days and a tail to 22 — so a 10-year window, same as lookupOrdersByExternalId.
+     *
+     * Fails CLOSED: any transport error, non-2xx, unparseable body or ignored filter returns ok=false
+     * with both lists empty, so a degraded OMS over-reports rather than silently suppressing rows.
+     */
+    static Map<String, Object> lookupReturnsByExternalId(Object rawConfig, Collection externalIds,
+                                                         Map options = [:]) {
+        List<String> ids = (externalIds ?: []).collect { normalize(it) }.findAll { it }.unique()
+        if (!ids) return [ok: false, foundIds: [], missingIds: [], errors: ["No externalIds provided for OMS returns lookup."]]
+
+        Map<String, Object> config = OmsRestSourceSupport.toPlainMap(rawConfig)
+        if (!config) return [ok: false, foundIds: [], missingIds: [], errors: ["OMS REST source config could not be read."]]
+
+        String endpointUrl = OmsRestSourceSupport.buildOrdersEndpointUrl(
+                normalize(config.baseUrl), DEFAULT_RETURNS_PATH)
+        Map<String, String> headers
+        try {
+            headers = OmsRestSourceSupport.buildHeaders(config)
+        } catch (IllegalArgumentException e) {
+            return [ok: false, foundIds: [], missingIds: [], errors: [normalize(e.message) ?: "OMS auth configuration is invalid."]]
+        }
+
+        long thruMillis = System.currentTimeMillis() + 86400000L
+        long fromMillis = thruMillis - 3650L * 86400000L
+        Set<String> found = new LinkedHashSet<String>()
+
+        for (List<String> chunk : ids.collate(normalizeInt(options?.chunkSize, RETURNS_LOOKUP_CHUNK_SIZE))) {
+            String url = new StringBuilder(endpointUrl)
+                    .append(endpointUrl.contains("?") ? "&" : "?")
+                    .append(RETURNS_WINDOW_FROM_PARAM).append("=").append(fromMillis)
+                    .append("&").append(RETURNS_WINDOW_THRU_PARAM).append("=").append(thruMillis)
+                    .append("&").append(RETURNS_EXTERNAL_ID_PARAM).append("=").append(chunk.join(","))
+                    .append("&pageIndex=0&pageSize=").append(Math.max(chunk.size() * 2, 50))
+                    .toString()
+            Map response
+            try {
+                response = OmsRestSourceSupport.callOmsEndpoint(url, headers, config)
+            } catch (Exception e) {
+                return [ok: false, foundIds: [], missingIds: [], errors: ["OMS returns lookup failed: ${e.message}".toString()]]
+            }
+            int statusCode = normalizeInt(response?.statusCode, 0)
+            if (statusCode < 200 || statusCode >= 300) {
+                return [ok: false, foundIds: [], missingIds: [], errors: ["OMS returns lookup failed with HTTP ${statusCode}.".toString()]]
+            }
+            Map body
+            try {
+                body = (Map) JSON_SLURPER.parseText(normalize(response?.body) ?: "{}")
+            } catch (Exception e) {
+                return [ok: false, foundIds: [], missingIds: [], errors: ["OMS returns lookup returned unparseable JSON: ${e.message}".toString()]]
+            }
+            List returned = (body.get("returns") instanceof List) ? (List) body.get("returns") : []
+            // ECHO-CHECK, non-negotiable: this endpoint answers a filter it does not implement with
+            // HTTP 200 and a full unfiltered corpus — `orderExternalId` was live-proven to do exactly
+            // that (306,957 rows for one order id, 2026-08-20). A record only counts as present when
+            // it echoes back an id this chunk actually asked for.
+            Set<String> chunkSet = new HashSet<String>(chunk)
+            boolean echoed = false
+            for (Object raw : returned) {
+                if (!(raw instanceof Map)) continue
+                String ext = normalize(((Map) raw).get("externalId"))
+                if (ext && chunkSet.contains(ext)) { found.add(ext); echoed = true }
+            }
+            if (!returned.isEmpty() && !echoed) {
+                return [ok: false, foundIds: [], missingIds: [],
+                        errors: ["OMS returns lookup did not honor the externalId filter (no returned record echoed a requested id).".toString()]]
+            }
+        }
+        return [ok: true, foundIds: new ArrayList<String>(found),
+                missingIds: ids.findAll { !found.contains(it) }, errors: []]
     }
 
     /**

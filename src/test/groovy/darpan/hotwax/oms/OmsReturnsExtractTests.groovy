@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test
 import static org.junit.jupiter.api.Assertions.assertEquals
 import static org.junit.jupiter.api.Assertions.assertFalse
 import static org.junit.jupiter.api.Assertions.assertNotNull
+import static org.junit.jupiter.api.Assertions.assertNull
 import static org.junit.jupiter.api.Assertions.assertTrue
 
 /**
@@ -424,5 +425,117 @@ class OmsReturnsExtractTests {
                 operator       : "EXCLUDE_IN",
                 filterValues   : "POS_RETURN_CHANNEL",
         ]]
+    }
+
+    // --- JOIN-KEY FALLBACK (2026-08-20): externalId is the returns-pair join key and OMS leaves it
+    // blank until a refund exists. Measured on the full 772-row live run, the fallback engaged 65
+    // times and every one matched a Shopify RETURN row — never a REFUND.
+
+    @Test
+    void aReturnWithNoExternalIdBorrowsTheJoinKeyFromShopifyReturnId() {
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            return [statusCode: 200, body: returnsBody([[returnId: "M206541", shopifyReturnId: "27097038979",
+                    statusId: "RETURN_REQUESTED", entryDate: 1787139140894L]], false)]
+        }
+
+        Map result = OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, null, [:])
+
+        Map record = (Map) ((List) result.records).first()
+        assertEquals("27097038979", record.externalId,
+                "a pending return must borrow its join key or it reaches the compare with no key at all")
+        assertEquals("27097038979", record.shopifyReturnId, "the source field must survive unchanged")
+    }
+
+    @Test
+    void aRealExternalIdIsNeverOverwrittenByShopifyReturnId() {
+        // The two hold DIFFERENT Shopify objects for a refunded return — externalId the refund id,
+        // shopifyReturnId the return id (32 of 45 sampled differed). Shopify suppresses the RETURN row
+        // once refunded, so overwriting here would break every refunded match.
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            return [statusCode: 200, body: returnsBody([[returnId: "M199462", externalId: "954959691907",
+                    shopifyReturnId: "26809008259", statusId: "RETURN_COMPLETED", entryDate: 1786644872320L]], false)]
+        }
+
+        Map result = OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, null, [:])
+
+        Map record = (Map) ((List) result.records).first()
+        assertEquals("954959691907", record.externalId, "the refund id must win over the return id")
+    }
+
+    @Test
+    void aReturnWithNeitherIdIsLeftAloneRatherThanInvented() {
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            return [statusCode: 200, body: returnsBody([[returnId: "M1", statusId: "RETURN_REQUESTED",
+                    entryDate: 1787139140894L]], false)]
+        }
+
+        Map result = OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, null, [:])
+
+        assertNull(((Map) ((List) result.records).first()).externalId)
+    }
+
+    // --- BY-ID LOOKUP: the missing-in-OMS verification mirror of Shopify's refund/return lookup.
+
+    @Test
+    void theLookupBatchesIdsAndEscapesTheRunWindow() {
+        List<String> urls = []
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            urls.add(request.url as String)
+            return [statusCode: 200, body: returnsBody([], false)]
+        }
+
+        List ids = (1..45).collect { "id${it}".toString() }
+        Map result = OmsReturnsSourceSupport.lookupReturnsByExternalId(baseConfig(), ids)
+
+        assertTrue(result.ok as Boolean)
+        assertEquals(3, urls.size(), "45 ids at chunk 20 must be 3 calls, not 45: ${urls.size()}")
+        assertTrue(urls.every { (it as String).contains("externalId=") }, "ids must go under externalId")
+        // A 10-year floor: OMS windows on entryDate while Shopify windows on the event createdAt, and
+        // the observed gap ran to 22 days. A by-id lookup narrowed by the run window is useless.
+        long from = ((urls.first() as String) =~ /returnDateFrom=(\d+)/)[0][1] as long
+        long thru = ((urls.first() as String) =~ /returnDateThru=(\d+)/)[0][1] as long
+        assertTrue(thru - from > 3000L * 86400000L, "lookup window must not be the run window")
+    }
+
+    @Test
+    void theLookupSplitsFoundFromMissing() {
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            return [statusCode: 200, body: returnsBody([[returnId: "M1", externalId: "aaa"]], false)]
+        }
+
+        Map result = OmsReturnsSourceSupport.lookupReturnsByExternalId(baseConfig(), ["aaa", "bbb"])
+
+        assertTrue(result.ok as Boolean)
+        assertEquals(["aaa"], result.foundIds)
+        assertEquals(["bbb"], result.missingIds)
+    }
+
+    @Test
+    void theLookupRefusesAResponseThatIgnoredTheFilter() {
+        // orderExternalId was live-proven to be silently ignored while still answering HTTP 200 with
+        // 306,957 unrelated rows. Counting those as "present" would suppress real differences.
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            return [statusCode: 200, body: returnsBody([[returnId: "M9", externalId: "something-else"]], false)]
+        }
+
+        Map result = OmsReturnsSourceSupport.lookupReturnsByExternalId(baseConfig(), ["aaa"])
+
+        assertFalse(result.ok as Boolean, "an ignored filter must fail the lookup, not classify ids")
+        assertEquals([], result.foundIds)
+        assertEquals([], result.missingIds)
+    }
+
+    @Test
+    void theLookupFailsClosedOnAnErrorStatus() {
+        OmsReturnsSourceSupport.setHttpClient { Map request -> return [statusCode: 500, body: "{}"] }
+
+        Map result = OmsReturnsSourceSupport.lookupReturnsByExternalId(baseConfig(), ["aaa"])
+
+        assertFalse(result.ok as Boolean)
+        assertEquals([], result.foundIds)
+        assertEquals([], result.missingIds, "a failed lookup must never classify an id as missing")
     }
 }
