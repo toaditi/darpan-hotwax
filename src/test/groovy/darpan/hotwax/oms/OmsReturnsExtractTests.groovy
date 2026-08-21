@@ -491,8 +491,13 @@ class OmsReturnsExtractTests {
         Map result = OmsReturnsSourceSupport.lookupReturnsByExternalId(baseConfig(), ids)
 
         assertTrue(result.ok as Boolean)
-        assertEquals(3, urls.size(), "45 ids at chunk 20 must be 3 calls, not 45: ${urls.size()}")
-        assertTrue(urls.every { (it as String).contains("externalId=") }, "ids must go under externalId")
+        // 3 chunks, and because NOTHING resolved by externalId every chunk also takes its
+        // shopifyReturnId pass — 6 calls, still batched, never one per id.
+        assertEquals(6, urls.size(), "45 ids at chunk 20 must batch, not go one-per-id: ${urls.size()}")
+        assertEquals(3, urls.count { (it as String).contains("externalId=") && !(it as String).contains("shopifyReturnId=") })
+        assertEquals(3, urls.count { (it as String).contains("shopifyReturnId=") })
+        assertTrue(urls.every { (it as String).contains("externalId=") || (it as String).contains("shopifyReturnId=") },
+                "every call must filter on one of the two id fields")
         // A 10-year floor: OMS windows on entryDate while Shopify windows on the event createdAt, and
         // the observed gap ran to 22 days. A by-id lookup narrowed by the run window is useless.
         long from = ((urls.first() as String) =~ /returnDateFrom=(\d+)/)[0][1] as long
@@ -502,7 +507,11 @@ class OmsReturnsExtractTests {
 
     @Test
     void theLookupSplitsFoundFromMissing() {
+        // Field-aware stub: a shopifyReturnId-filtered query answers with THAT field populated, which
+        // is what the endpoint really does and what the per-field echo-check requires.
         OmsReturnsSourceSupport.setHttpClient { Map request ->
+            String url = request.url as String
+            if (url.contains("shopifyReturnId=")) return [statusCode: 200, body: returnsBody([], false)]
             return [statusCode: 200, body: returnsBody([[returnId: "M1", externalId: "aaa"]], false)]
         }
 
@@ -511,6 +520,48 @@ class OmsReturnsExtractTests {
         assertTrue(result.ok as Boolean)
         assertEquals(["aaa"], result.foundIds)
         assertEquals(["bbb"], result.missingIds)
+    }
+
+    @Test
+    void theLookupFindsAPendingReturnThatOnlyShopifyReturnIdCanReach() {
+        // Live 2026-08-21: six RETURN_REQUESTED rows resolved 0/6 by externalId and 6/6 by
+        // shopifyReturnId, because OMS leaves externalId NULL until a refund exists. Querying one
+        // field reported all six as confirmed-missing while OMS held every one.
+        List<String> urls = []
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            String url = request.url as String
+            urls.add(url)
+            if (url.contains("shopifyReturnId=")) {
+                return [statusCode: 200, body: returnsBody([[returnId: "M208190", shopifyReturnId: "27151073411",
+                        statusId: "RETURN_REQUESTED"]], false)]
+            }
+            return [statusCode: 200, body: returnsBody([], false)]
+        }
+
+        Map result = OmsReturnsSourceSupport.lookupReturnsByExternalId(baseConfig(), ["27151073411"])
+
+        assertTrue(result.ok as Boolean)
+        assertEquals(["27151073411"], result.foundIds)
+        assertEquals([], result.missingIds)
+        assertEquals(2, urls.size(), "one externalId pass then one shopifyReturnId pass")
+    }
+
+    @Test
+    void theSecondPassOnlyAsksForIdsTheFirstDidNotResolve() {
+        List<String> urls = []
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            String url = request.url as String
+            urls.add(url)
+            if (url.contains("shopifyReturnId=")) return [statusCode: 200, body: returnsBody([], false)]
+            return [statusCode: 200, body: returnsBody([[returnId: "M1", externalId: "aaa"]], false)]
+        }
+
+        OmsReturnsSourceSupport.lookupReturnsByExternalId(baseConfig(), ["aaa", "bbb"])
+
+        String second = urls.find { (it as String).contains("shopifyReturnId=") }
+        assertNotNull(second)
+        assertTrue(second.contains("shopifyReturnId=bbb"), "second pass must carry only the unresolved id: ${second}")
+        assertFalse(second.contains("aaa"), "an id already resolved must not be asked again: ${second}")
     }
 
     @Test

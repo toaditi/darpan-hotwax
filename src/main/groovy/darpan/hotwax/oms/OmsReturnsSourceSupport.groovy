@@ -32,6 +32,8 @@ class OmsReturnsSourceSupport {
     static final int DEFAULT_RETURNS_PAGE_SIZE = 500
     static final int MAX_RETURNS_PAGE_COUNT = 20000
     static final String RETURNS_EXTERNAL_ID_PARAM = "externalId"
+    /** OMS leaves externalId BLANK until a refund exists; this field carries the id from creation. */
+    static final String RETURNS_SHOPIFY_RETURN_ID_PARAM = "shopifyReturnId"
     /** 20 ids per call is the width live-proven 2026-08-20; the endpoint accepts CSV and repeated params. */
     static final int RETURNS_LOOKUP_CHUNK_SIZE = 20
 
@@ -321,48 +323,79 @@ class OmsReturnsSourceSupport {
         Set<String> found = new LinkedHashSet<String>()
 
         for (List<String> chunk : ids.collate(normalizeInt(options?.chunkSize, RETURNS_LOOKUP_CHUNK_SIZE))) {
-            String url = new StringBuilder(endpointUrl)
-                    .append(endpointUrl.contains("?") ? "&" : "?")
-                    .append(RETURNS_WINDOW_FROM_PARAM).append("=").append(fromMillis)
-                    .append("&").append(RETURNS_WINDOW_THRU_PARAM).append("=").append(thruMillis)
-                    .append("&").append(RETURNS_EXTERNAL_ID_PARAM).append("=").append(chunk.join(","))
-                    .append("&pageIndex=0&pageSize=").append(Math.max(chunk.size() * 2, 50))
-                    .toString()
-            Map response
-            try {
-                response = OmsRestSourceSupport.callOmsEndpoint(url, headers, config)
-            } catch (Exception e) {
-                return [ok: false, foundIds: [], missingIds: [], errors: ["OMS returns lookup failed: ${e.message}".toString()]]
-            }
-            int statusCode = normalizeInt(response?.statusCode, 0)
-            if (statusCode < 200 || statusCode >= 300) {
-                return [ok: false, foundIds: [], missingIds: [], errors: ["OMS returns lookup failed with HTTP ${statusCode}.".toString()]]
-            }
-            Map body
-            try {
-                body = (Map) JSON_SLURPER.parseText(normalize(response?.body) ?: "{}")
-            } catch (Exception e) {
-                return [ok: false, foundIds: [], missingIds: [], errors: ["OMS returns lookup returned unparseable JSON: ${e.message}".toString()]]
-            }
-            List returned = (body.get("returns") instanceof List) ? (List) body.get("returns") : []
-            // ECHO-CHECK, non-negotiable: this endpoint answers a filter it does not implement with
-            // HTTP 200 and a full unfiltered corpus — `orderExternalId` was live-proven to do exactly
-            // that (306,957 rows for one order id, 2026-08-20). A record only counts as present when
-            // it echoes back an id this chunk actually asked for.
-            Set<String> chunkSet = new HashSet<String>(chunk)
-            boolean echoed = false
-            for (Object raw : returned) {
-                if (!(raw instanceof Map)) continue
-                String ext = normalize(((Map) raw).get("externalId"))
-                if (ext && chunkSet.contains(ext)) { found.add(ext); echoed = true }
-            }
-            if (!returned.isEmpty() && !echoed) {
-                return [ok: false, foundIds: [], missingIds: [],
-                        errors: ["OMS returns lookup did not honor the externalId filter (no returned record echoed a requested id).".toString()]]
+            // TWO-FIELD LOOKUP (2026-08-21). externalId alone silently misses every return that has no
+            // refund yet: OMS leaves that column NULL until one exists and carries the id only in
+            // shopifyReturnId. Probed on six live RETURN_REQUESTED rows — 0/6 resolved by externalId,
+            // 6/6 by shopifyReturnId — so a by-externalId-only lookup reported all six as "confirmed
+            // missing" when OMS held every one of them. Same asymmetry the extractor's
+            // applyJoinKeyFallback exists for; this is its lookup-side twin.
+            //
+            // The second call runs ONLY for ids the first did not resolve, so a window of settled
+            // returns still costs one call per chunk.
+            Map first = queryReturnsByField(endpointUrl, headers, config, RETURNS_EXTERNAL_ID_PARAM,
+                    chunk, fromMillis, thruMillis)
+            if (first.error) return [ok: false, foundIds: [], missingIds: [], errors: [first.error]]
+            found.addAll((Collection<String>) first.found)
+
+            List<String> unresolved = chunk.findAll { !found.contains(it) }
+            if (unresolved) {
+                Map second = queryReturnsByField(endpointUrl, headers, config, RETURNS_SHOPIFY_RETURN_ID_PARAM,
+                        unresolved, fromMillis, thruMillis)
+                if (second.error) return [ok: false, foundIds: [], missingIds: [], errors: [second.error]]
+                found.addAll((Collection<String>) second.found)
             }
         }
         return [ok: true, foundIds: new ArrayList<String>(found),
                 missingIds: ids.findAll { !found.contains(it) }, errors: []]
+    }
+
+
+    /**
+     * One filtered page against the returns endpoint, echo-checked on the SAME field it filtered by.
+     * Returns [found: Set, error: String|null] — a transport or contract failure yields an error and
+     * never a partial classification, because "not found" and "could not ask" must not look alike.
+     */
+    private static Map queryReturnsByField(String endpointUrl, Map<String, String> headers, Map config,
+                                           String paramName, List<String> ids, long fromMillis, long thruMillis) {
+        Set<String> found = new LinkedHashSet<String>()
+        String url = new StringBuilder(endpointUrl)
+                .append(endpointUrl.contains("?") ? "&" : "?")
+                .append(RETURNS_WINDOW_FROM_PARAM).append("=").append(fromMillis)
+                .append("&").append(RETURNS_WINDOW_THRU_PARAM).append("=").append(thruMillis)
+                .append("&").append(paramName).append("=").append(ids.join(","))
+                .append("&pageIndex=0&pageSize=").append(Math.max(ids.size() * 2, 50))
+                .toString()
+        Map response
+        try {
+            response = OmsRestSourceSupport.callOmsEndpoint(url, headers, config)
+        } catch (Exception e) {
+            return [found: found, error: "OMS returns lookup failed: ${e.message}".toString()]
+        }
+        int statusCode = normalizeInt(response?.statusCode, 0)
+        if (statusCode < 200 || statusCode >= 300) {
+            return [found: found, error: "OMS returns lookup failed with HTTP ${statusCode}.".toString()]
+        }
+        Map body
+        try {
+            body = (Map) JSON_SLURPER.parseText(normalize(response?.body) ?: "{}")
+        } catch (Exception e) {
+            return [found: found, error: "OMS returns lookup returned unparseable JSON: ${e.message}".toString()]
+        }
+        List returned = (body.get("returns") instanceof List) ? (List) body.get("returns") : []
+        // ECHO-CHECK against the field actually filtered on: this endpoint answers a filter it does not
+        // implement with HTTP 200 and an unfiltered corpus (orderExternalId, live-proven 2026-08-20).
+        Set<String> requested = new HashSet<String>(ids)
+        boolean echoed = false
+        for (Object raw : returned) {
+            if (!(raw instanceof Map)) continue
+            String value = normalize(((Map) raw).get(paramName))
+            if (value && requested.contains(value)) { found.add(value); echoed = true }
+        }
+        if (!returned.isEmpty() && !echoed) {
+            return [found: new LinkedHashSet<String>(),
+                    error: "OMS returns lookup did not honor the ${paramName} filter (no returned record echoed a requested id).".toString()]
+        }
+        return [found: found, error: null]
     }
 
     /**
