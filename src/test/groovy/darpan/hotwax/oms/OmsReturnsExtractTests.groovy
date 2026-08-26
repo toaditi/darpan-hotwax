@@ -589,4 +589,137 @@ class OmsReturnsExtractTests {
         assertEquals([], result.foundIds)
         assertEquals([], result.missingIds, "a failed lookup must never classify an id as missing")
     }
+
+    // --- transient gateway failure resilience -------------------------------------------------
+    // Prod run 100616 (2026-08-26) died on a single 504 from the OMS gateway. Every page fetched
+    // before it was discarded by sink.abort(), and the automation re-drove the whole window from
+    // page 0 on a 5-minute backoff. A page-level retry is the cheaper and more targeted answer:
+    // it costs nothing when nothing fails, and it does not re-pay for the pages that succeeded.
+
+    @Test
+    void retriesTheSamePageWhenTheGatewayReturns504AndSucceedsOnTheRetry() {
+        int callCount = 0
+        List<String> urls = []
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            callCount++
+            urls.add(request.url as String)
+            if (callCount == 1) return [statusCode: 504, body: "<html>gateway timeout</html>"]
+            return [statusCode: 200, body: returnsBody([returnRecord("1001", "5001")], false)]
+        }
+
+        Map result = OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, null, [retryBackoffMillis: 0])
+
+        assertEquals([], result.errors, "a transient 504 that clears on retry must not fail the extract")
+        assertEquals(1, result.recordCount)
+        assertEquals(2, callCount, "the gatewayed page must be re-requested")
+        assertEquals(urls[0], urls[1], "the retry must re-request the SAME page, never skip past it")
+    }
+
+    @Test
+    void givesUpOnTheRetryCeilingWhenEveryAttemptGateways() {
+        int callCount = 0
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            callCount++
+            return [statusCode: 504, body: "gateway timeout"]
+        }
+
+        Map result = OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, null, [retryBackoffMillis: 0])
+
+        assertFalse((result.errors as List).isEmpty(), "a 504 that never clears must still fail the extract")
+        assertEquals(3, callCount, "a page is attempted maxPageAttempts times, never retried without bound")
+    }
+
+    @Test
+    void theGatewayFailureMessageNamesThePageAndTheServersOwnDetail() {
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            if ((request.url as String).contains("pageIndex=0")) {
+                return [statusCode: 200, body: returnsBody([returnRecord("1001", "5001")], true)]
+            }
+            return [statusCode: 504, body: JsonOutput.toJson([errorCode: "GATEWAY_TIMEOUT",
+                    message: "upstream took too long"])]
+        }
+
+        Map result = OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, null, [retryBackoffMillis: 0])
+
+        String error = (result.errors as List).join(" ")
+        assertTrue(error.contains("page 1"),
+                "the message must name WHICH page died — page 0 means the window is too wide, a deep page means offset decay: ${error}")
+        assertTrue(error.contains("GATEWAY_TIMEOUT"),
+                "the server's own error detail must not be discarded: ${error}")
+        assertTrue(error.contains("3 attempts"),
+                "the message must say the retries were exhausted, so a reader knows this was not a one-off: ${error}")
+    }
+
+    @Test
+    void doesNotRetryAStatusThatARetryCannotFix() {
+        // Regression guard, not a driver: 401 is a config failure. Retrying it three times only
+        // delays a certain failure and triples the load on an endpoint already rejecting us.
+        int callCount = 0
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            callCount++
+            return [statusCode: 401, body: "unauthorized"]
+        }
+
+        Map result = OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, null, [retryBackoffMillis: 0])
+
+        assertFalse((result.errors as List).isEmpty())
+        assertEquals(1, callCount, "an auth failure must fail on the first attempt")
+    }
+
+    // --- operator-tunable page size -----------------------------------------------------------
+    // The systematic half of the 504: when OMS cannot build a 500-row page inside its gateway's
+    // deadline, no amount of retrying helps and the operator needs a smaller page. pageSize is
+    // asserted with endsWith because buildReturnsUrl appends it last, and "pageSize=100" is a
+    // prefix of "pageSize=1000" — contains() would pass on the wrong value.
+
+    @Test
+    void theReturnsPageSizeConfiguredOnTheSourceIsSentToTheEndpoint() {
+        String capturedUrl = null
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            capturedUrl = request.url as String
+            return [statusCode: 200, body: returnsBody([], false)]
+        }
+
+        OmsReturnsSourceSupport.extractReturns(baseConfig() + [returnsPageSize: 100],
+                "2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", null, null, null, [:])
+
+        assertTrue(capturedUrl.endsWith("pageSize=100"),
+                "an operator facing a slow OMS must be able to lower the page size from config: ${capturedUrl}")
+    }
+
+    @Test
+    void anOutOfRangeReturnsPageSizeIsClampedRatherThanSentRaw() {
+        String capturedUrl = null
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            capturedUrl = request.url as String
+            return [statusCode: 200, body: returnsBody([], false)]
+        }
+
+        OmsReturnsSourceSupport.extractReturns(baseConfig() + [returnsPageSize: 99999],
+                "2026-05-01T00:00:00Z", "2026-05-02T00:00:00Z", null, null, null, [:])
+
+        assertTrue(capturedUrl.endsWith("pageSize=1000"),
+                "a mistyped page size must clamp to the ceiling, not ask OMS for 99999 rows: ${capturedUrl}")
+    }
+
+    @Test
+    void theReturnsPageSizeFallsBackToTheShippedDefaultWhenUnset() {
+        // Regression guard, not a driver: every existing tenant config has no returnsPageSize
+        // column value, and none of them may change page size just because the knob was added.
+        String capturedUrl = null
+        OmsReturnsSourceSupport.setHttpClient { Map request ->
+            capturedUrl = request.url as String
+            return [statusCode: 200, body: returnsBody([], false)]
+        }
+
+        OmsReturnsSourceSupport.extractReturns(baseConfig(), "2026-05-01T00:00:00Z",
+                "2026-05-02T00:00:00Z", null, null, null, [:])
+
+        assertTrue(capturedUrl.endsWith("pageSize=500"),
+                "unset config must keep the shipped default: ${capturedUrl}")
+    }
 }

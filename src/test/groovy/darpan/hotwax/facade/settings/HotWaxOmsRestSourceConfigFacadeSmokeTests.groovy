@@ -341,6 +341,51 @@ class HotWaxOmsRestSourceConfigFacadeSmokeTests {
     }
 
     @Test
+    void aSavedReturnsPageSizeSurvivesAnUpdateThatOmitsIt() {
+        // The OMS config form carries connectTimeoutSeconds/readTimeoutSeconds in its model but
+        // renders no input for them, so every client sends whatever it last loaded — and any client
+        // that does not know about returnsPageSize omits it entirely. Since save#HotWaxOmsRestSourceConfig
+        // writes a full row, an omitted value would silently reset the operator's page size to 500,
+        // which is precisely the setting they lowered to get past a gateway timeout.
+        ec.user.setPreference(TenantAccessSupport.ACTIVE_TENANT_PREFERENCE_KEY, GORJANA)
+
+        Map<String, Object> created = saveFacade([
+            omsRestSourceConfigId: "GORJANA_PAGESIZE_HOTWAX",
+            description          : "Page Size One",
+            baseUrl              : "https://pagesize.hotwax.io",
+            ordersPath           : "/rest/s1/oms/orders",
+            authType             : "NONE",
+            timeZone             : "America/Chicago",
+            connectTimeoutSeconds: 30,
+            readTimeoutSeconds   : 60,
+            returnsPageSize      : 100,
+            isActive             : true,
+            canReadOrders        : true,
+        ])
+        assertTrue((Boolean) created.ok, created.errors?.toString())
+        assertEquals(100, findOne("GORJANA_PAGESIZE_HOTWAX").returnsPageSize as Integer)
+
+        ec.message.clearErrors()
+        Map<String, Object> updated = saveFacade([
+            omsRestSourceConfigId: "GORJANA_PAGESIZE_HOTWAX",
+            description          : "Page Size One Updated",
+            baseUrl              : "https://pagesize.hotwax.io",
+            ordersPath           : "/rest/s1/oms/orders",
+            authType             : "NONE",
+            timeZone             : "America/Chicago",
+            connectTimeoutSeconds: 30,
+            readTimeoutSeconds   : 60,
+            isActive             : true,
+            canReadOrders        : true,
+        ])
+        assertTrue((Boolean) updated.ok, updated.errors?.toString())
+        def stored = findOne("GORJANA_PAGESIZE_HOTWAX")
+        assertEquals("Page Size One Updated", stored.description)
+        assertEquals(100, stored.returnsPageSize as Integer,
+            "an update that omits returnsPageSize must keep the stored value, not reset it to the default")
+    }
+
+    @Test
     void deleteReportsNotFoundForMissingConfig() {
         ec.user.setPreference(TenantAccessSupport.ACTIVE_TENANT_PREFERENCE_KEY, GORJANA)
         Map<String, Object> result = deleteFacade("GORJANA_DOES_NOT_EXIST")

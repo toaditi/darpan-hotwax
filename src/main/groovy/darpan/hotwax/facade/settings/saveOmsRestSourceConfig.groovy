@@ -2,6 +2,7 @@ import darpan.facade.common.FacadeSupport
 import darpan.facade.common.SharedConfigAccessSupport
 import darpan.facade.common.TenantAccessSupport
 import darpan.hotwax.oms.OmsRestSourceSupport
+import darpan.hotwax.oms.OmsReturnsSourceSupport
 
 import static darpan.common.ValueSupport.normalize
 import static darpan.common.ValueSupport.normalizeBool
@@ -101,6 +102,19 @@ if (!ec.message.hasError()) {
         // saves it — only a brand-new row is assigned to the active tenant. Reassigning here would
         // hand ownership to whichever peer saved last and anchor the peer group on the wrong tenant.
         String ownerTenantUserGroupId = existingConfig?.companyUserGroupId ?: activeTenantUserGroupId
+        // Preserve-on-omit, the same guard password/apiToken use below. This service writes a FULL
+        // row, and the OMS config form renders no input for returnsPageSize (exactly as with the
+        // timeouts), so any client that does not know the field simply omits it. Defaulting on omit
+        // would reset the page size an operator lowered to clear a gateway timeout, on their next
+        // unrelated edit. Clamped here as well as at extraction time so a stored value can never
+        // read back as accepted while the extractor quietly uses a different one.
+        Integer requestedReturnsPageSize = normalizeInt(returnsPageSize)
+        if (requestedReturnsPageSize == null) requestedReturnsPageSize = normalizeInt(existingConfig?.returnsPageSize)
+        Integer returnsPageSizeValue = requestedReturnsPageSize == null
+                ? OmsReturnsSourceSupport.DEFAULT_RETURNS_PAGE_SIZE
+                : Math.min(OmsReturnsSourceSupport.MAX_RETURNS_PAGE_SIZE,
+                        Math.max(OmsReturnsSourceSupport.MIN_RETURNS_PAGE_SIZE, requestedReturnsPageSize))
+
         Map configMap = [
                 omsRestSourceConfigId : configIdValue,
                 description           : descriptionValue,
@@ -114,6 +128,7 @@ if (!ec.message.hasError()) {
                 headersJson           : headersJsonValue,
                 connectTimeoutSeconds : connectTimeoutValue,
                 readTimeoutSeconds    : readTimeoutValue,
+                returnsPageSize       : returnsPageSizeValue,
                 isActive              : isActiveValue,
                 canReadOrders         : canReadOrdersValue,
                 createdDate           : existingConfig?.createdDate ?: ec.user.nowTimestamp,

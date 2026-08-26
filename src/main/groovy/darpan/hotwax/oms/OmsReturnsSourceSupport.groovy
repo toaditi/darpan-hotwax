@@ -30,12 +30,28 @@ class OmsReturnsSourceSupport {
     static final String DEFAULT_FILE_NAME_PREFIX = "oms-returns"
     static final String RETURN_CHANNEL_FIELD = "returnChannelEnumId"
     static final int DEFAULT_RETURNS_PAGE_SIZE = 500
+    /** Same 1..1000 envelope resolveOrdersPageSize clamps to, for the same reason. */
+    static final int MIN_RETURNS_PAGE_SIZE = 1
+    static final int MAX_RETURNS_PAGE_SIZE = 1000
     static final int MAX_RETURNS_PAGE_COUNT = 20000
     static final String RETURNS_EXTERNAL_ID_PARAM = "externalId"
     /** OMS leaves externalId BLANK until a refund exists; this field carries the id from creation. */
     static final String RETURNS_SHOPIFY_RETURN_ID_PARAM = "shopifyReturnId"
     /** 20 ids per call is the width live-proven 2026-08-20; the endpoint accepts CSV and repeated params. */
     static final int RETURNS_LOOKUP_CHUNK_SIZE = 20
+    /** Attempts per page, inclusive of the first. 3 covers a gateway blip without hammering a sick host. */
+    static final int DEFAULT_MAX_PAGE_ATTEMPTS = 3
+    /** Linear backoff step: attempt N waits N x this before re-requesting. */
+    static final int DEFAULT_RETRY_BACKOFF_MILLIS = 2000
+    /**
+     * Statuses a retry can actually fix. All four are "the server is momentarily unable", not "the
+     * request is wrong": 502/503/504 come from the gateway rather than the OMS app, and 429 is an
+     * explicit ask to come back later.
+     *
+     * 500 is deliberately absent. It signals a deterministic server-side fault, so three attempts
+     * only triple the load and delay a certain failure by the whole backoff.
+     */
+    static final Set<Integer> RETRYABLE_STATUS_CODES = [429, 502, 503, 504] as Set
 
     private static final JsonSlurper JSON_SLURPER = new JsonSlurper()
 
@@ -124,7 +140,9 @@ class OmsReturnsSourceSupport {
             return failure([normalize(e.message) ?: "Configured exclusion rules are invalid."], [], retainRecords)
         }
 
-        int pageSize = normalizeInt(options?.pageSize, DEFAULT_RETURNS_PAGE_SIZE)
+        int pageSize = resolveReturnsPageSize(config, options)
+        int maxPageAttempts = Math.max(1, normalizeInt(options?.maxPageAttempts, DEFAULT_MAX_PAGE_ATTEMPTS))
+        int retryBackoffMillis = Math.max(0, normalizeInt(options?.retryBackoffMillis, DEFAULT_RETRY_BACKOFF_MILLIS))
         List<Map<String, Object>> collected = []
         OutputSink sink = new OutputSink(targetFile)
         Map<String, Object> serverCounts = [:]
@@ -140,14 +158,13 @@ class OmsReturnsSourceSupport {
                     break
                 }
                 String url = buildReturnsUrl(endpointUrl, fromMillis, thruMillis, pageIndex, pageSize)
-                // Reused, not hand-rolled: callOmsEndpoint already handles gzip, status extraction,
-                // and dispatches through the injected test client (see setHttpClient above).
-                Map response = OmsRestSourceSupport.callOmsEndpoint(url, headers, config)
-                int statusCode = normalizeInt(response?.statusCode, 0)
-                if (statusCode < 200 || statusCode >= 300) {
-                    errors.add("OMS returns request failed with status ${statusCode}.".toString())
+                Map<String, Object> attempt = requestReturnsPage(url, headers, config, pageIndex,
+                        maxPageAttempts, retryBackoffMillis, warnings)
+                if (!attempt.get("ok")) {
+                    errors.add((String) attempt.get("error"))
                     break
                 }
+                Map response = (Map) attempt.get("response")
 
                 Map body
                 try {
@@ -247,6 +264,79 @@ class OmsReturnsSourceSupport {
         // set it null.
         if (retainRecords) result.put("records", collected)
         return result
+    }
+
+    /**
+     * One page, retried a bounded number of times for the statuses a retry can fix.
+     *
+     * Retry lives HERE rather than only at the automation layer on purpose. A failure that escapes
+     * this method aborts the sink and deletes the part-written file, so the automation's own retry
+     * (AutomationExecutionSupport.buildFailureFields, transient -> PENDING on a 5-minute backoff)
+     * re-fetches the window from page 0 and re-pays for every page that had already succeeded. A
+     * page-level attempt costs one request and a few seconds instead.
+     *
+     * On failure it returns a message naming the page, the attempts spent, and the server's own
+     * error detail. That page number is the whole diagnostic: page 0 says the window is too wide
+     * for the endpoint, while a deep page says offset decay, and the two want opposite remedies.
+     */
+    protected static Map<String, Object> requestReturnsPage(String url, Map<String, String> headers, Map config,
+                                                            int pageIndex, int maxAttempts, int backoffMillis,
+                                                            List<String> warnings) {
+        int lastStatus = 0
+        String lastDetail = null
+        int attemptsUsed = 0
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            attemptsUsed = attempt
+            // Reused, not hand-rolled: callOmsEndpoint already handles gzip, status extraction,
+            // and dispatches through the injected test client (see setHttpClient above).
+            Map response = OmsRestSourceSupport.callOmsEndpoint(url, headers, config)
+            int statusCode = normalizeInt(response?.statusCode, 0)
+            if (statusCode >= 200 && statusCode < 300) return [ok: true, response: response]
+
+            lastStatus = statusCode
+            // Read on EVERY attempt, not just the last: a gateway's 504 body is usually empty while
+            // the app's own 503 carries a real code, and whichever attempt saw detail is worth
+            // keeping over a later blank one.
+            lastDetail = OmsRestSourceSupport.describeEndpointError(response?.body) ?: lastDetail
+            if (!RETRYABLE_STATUS_CODES.contains(statusCode)) break
+            if (attempt >= maxAttempts) break
+            warnings.add(("OMS returns page ${pageIndex} failed with status ${statusCode}; " +
+                    "retrying (attempt ${attempt + 1} of ${maxAttempts}).").toString())
+            sleepQuietly((long) backoffMillis * attempt)
+        }
+
+        String attemptsNote = attemptsUsed > 1 ? " after ${attemptsUsed} attempts" : ""
+        String detailNote = lastDetail ? ": ${lastDetail}" : ""
+        return [ok: false, error: ("OMS returns request for page ${pageIndex} failed with " +
+                "status ${lastStatus}${attemptsNote}${detailNote}.").toString()]
+    }
+
+    /**
+     * Restores the interrupt flag rather than swallowing it: this runs inside a Moqui service
+     * thread, and a cancel that arrives mid-backoff must stay visible to the code above.
+     */
+    private static void sleepQuietly(long millis) {
+        if (millis <= 0L) return
+        try {
+            Thread.sleep(millis)
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    /**
+     * Page size, in precedence order: an explicit caller option, then the operator's per-source
+     * setting, then the shipped default. Clamped to MIN..MAX for the reason the orders sibling
+     * clamps — a mistyped 99999 must not become a request that is certain to time the gateway out.
+     *
+     * This is the lever the 504 on prod run 100616 had no answer for: when OMS cannot build a
+     * 500-row page inside its gateway deadline, retrying cannot help and only a smaller page can.
+     */
+    protected static int resolveReturnsPageSize(Map config, Map options) {
+        Integer requested = normalizeInt(options?.pageSize)
+        if (requested == null) requested = normalizeInt(config?.returnsPageSize)
+        if (requested == null) return DEFAULT_RETURNS_PAGE_SIZE
+        return Math.min(MAX_RETURNS_PAGE_SIZE, Math.max(MIN_RETURNS_PAGE_SIZE, requested))
     }
 
     protected static String buildReturnsUrl(String endpointUrl, Long fromMillis, Long thruMillis,

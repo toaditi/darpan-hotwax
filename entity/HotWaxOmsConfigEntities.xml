@@ -19,6 +19,9 @@
         <field name="headersJson" type="text-long"/>
         <field name="connectTimeoutSeconds" type="number-integer" default="30"/>
         <field name="readTimeoutSeconds" type="number-integer" default="60"/>
+        <field name="returnsPageSize" type="number-integer" default="500">
+            <description>Rows requested per page from the OMS reconciliationReturns endpoint. Lower this when OMS cannot build a full page inside its gateway timeout. Clamped to 1..1000 at extraction time.</description>
+        </field>
         <field name="isActive" type="text-indicator" default="'Y'"/>
         <field name="canReadOrders" type="text-indicator" default="'Y'"/>
         <field name="createdDate" type="date-time"/>

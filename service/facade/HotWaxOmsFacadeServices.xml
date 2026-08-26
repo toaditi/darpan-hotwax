@@ -37,6 +37,7 @@
                 <parameter name="customHeaderNames" type="List"/>
                 <parameter name="connectTimeoutSeconds" type="Integer"/>
                 <parameter name="readTimeoutSeconds" type="Integer"/>
+                <parameter name="returnsPageSize" type="Integer"/>
                 <parameter name="isActive"/>
                 <parameter name="canReadOrders" type="Boolean"/>
                 <parameter name="createdDate"/>
@@ -70,6 +71,9 @@
             <parameter name="headersJson"/>
             <parameter name="connectTimeoutSeconds" type="Integer" default-value="30"/>
             <parameter name="readTimeoutSeconds" type="Integer" default-value="60"/>
+            <parameter name="returnsPageSize" type="Integer">
+                <description>Rows per page requested from the OMS reconciliationReturns endpoint, 1..1000. Omit to keep the stored value; unset means the 500 default. Lower it when OMS cannot build a full page inside its gateway timeout.</description>
+            </parameter>
             <parameter name="isActive" type="Boolean" default-value="true"/>
             <parameter name="canReadOrders" type="Boolean" default-value="true"/>
         </in-parameters>
@@ -93,6 +97,7 @@
                 <parameter name="customHeaderNames" type="List"/>
                 <parameter name="connectTimeoutSeconds" type="Integer"/>
                 <parameter name="readTimeoutSeconds" type="Integer"/>
+                <parameter name="returnsPageSize" type="Integer"/>
                 <parameter name="isActive"/>
                 <parameter name="canReadOrders" type="Boolean"/>
                 <parameter name="createdDate"/>
