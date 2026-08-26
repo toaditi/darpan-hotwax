@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/moqui-conf-3.xsd"
-        name="darpan-hotwax" version="0.7.0">
+        name="darpan-hotwax" version="0.8.0">
     <depends-on name="darpan"/>
     <entity-file location="entity"/>
     <service-directory location="service"/>
